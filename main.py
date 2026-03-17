@@ -51,9 +51,9 @@ PIXABAY_API_KEY      = os.environ.get("PIXABAY_API_KEY", "")
 # Після верифікації картки замініть на кращі моделі
 # Замініть на актуальні моделі після верифікації картки
 GEMINI_MODELS = [
-    "gemini-2.5-flash",   # модель 1 — замініть
+    "gemini-3.1-flash-lite-preview",   # модель 1 — замініть
     "gemini-2.5-flash-lite",                  # модель 2 — замініть
-    "gemini-3.1-flash-lite-preview",             # модель 3 — запасна
+    "gemini-2.5-flash",             # модель 3 — запасна
 ]
 
 # ──────────────────────────────────────────────
@@ -884,7 +884,7 @@ body {{
   border: 1px solid rgba(255,255,255,0.15);
 }}
 .topbar-text {{
-  font-size: 52px;
+  font-size: 48px;
   font-weight: 700;
   color: #ffffff;
   white-space: nowrap;
@@ -900,7 +900,7 @@ body {{
   justify-content: center;
   align-items: center;
   padding: 200px 64px 120px 64px;
-  gap: 36px;
+  gap: 40px;
   z-index: 5;
 }}
 .glass-block {{
@@ -927,25 +927,26 @@ body {{
 
 
 def build_daily_phrase(data: dict, photo_b64: str) -> str:
-    phrase   = data.get("phrase_en", "")
-    ex_en    = data.get("example_en", "")
-    ex_ua    = data.get("example_ua", "")
-    ts = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    phrase = data.get("phrase_en", "")
+    ex_en  = data.get("example_en", "")
+    ex_ua  = data.get("example_ua", "")
+    ts_strong = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    ts_soft   = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
     blocks = f"""
-  <div class="glass-block">
-    <div style="font-size:72px; font-weight:800; color:#ffffff;
-                {ts} line-height:1.2;">
+  <div class="glass-block" style="padding: 72px 56px;">
+    <div style="font-size:68px; font-weight:800; color:#ffffff;
+                {ts_strong} line-height:1.2;">
       {phrase}
     </div>
   </div>
-  <div class="glass-block">
-    <div style="font-size:58px; font-weight:700; color:#ffffff;
-                {ts} line-height:1.3; margin-bottom:24px;">
+  <div class="glass-block" style="padding: 52px 56px;">
+    <div style="font-size:68px; font-weight:700; color:#ffffff;
+                {ts_strong} line-height:1.3; margin-bottom:30px;">
       {ex_en}
     </div>
-    <div style="font-size:58px; font-weight:400; color:rgba(255,255,255,0.93);
-                {ts} line-height:1.3;">
+    <div style="font-size:54px; font-weight:400; color:rgba(220,235,255,0.95);
+                {ts_soft} line-height:1.3;">
       {ex_ua}
     </div>
   </div>"""
@@ -953,30 +954,32 @@ def build_daily_phrase(data: dict, photo_b64: str) -> str:
 
 
 def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
-    phrases  = data.get("phrases", [])
-    cat_name = category.get("name", "")
-    ts = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    phrases     = data.get("phrases", [])
+    topic_name  = category.get("name", "")
+    topic_emoji = category.get("emoji", "")
+    ts_strong = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    ts_soft   = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
-    # Підзаголовок теми над блоками
-    subtitle = f"""
-  <div style="width:100%; text-align:left; padding: 0 8px;">
-    <div style="font-size:72px; font-weight:800; color:#ffffff; {ts} line-height:1.1;">
-      {cat_name}
+    topic_header = f"""
+  <div style="width:100%; text-align:left; padding: 0 8px; margin-bottom:4px;">
+    <div style="font-size:66px; font-weight:800; color:#ffffff;
+                {ts_strong} line-height:1.1;">
+      {topic_emoji} {topic_name}
     </div>
   </div>"""
 
-    blocks = subtitle
+    blocks = topic_header
     for p in phrases[:5]:
         en = p.get("en", "")
         ua = p.get("ua", "")
         blocks += f"""
-  <div class="glass-block" style="padding: 32px 52px;">
+  <div class="glass-block" style="padding: 28px 52px;">
     <div style="font-size:52px; font-weight:700; color:#ffffff;
-                {ts} line-height:1.25; margin-bottom:12px;">
+                {ts_strong} line-height:1.25; margin-bottom:20px;">
       {en}
     </div>
-    <div style="font-size:50px; font-weight:400; color:rgba(255,255,255,0.93);
-                {ts} line-height:1.25;">
+    <div style="font-size:44px; font-weight:400; color:rgba(220,235,255,0.95);
+                {ts_soft} line-height:1.25;">
       {ua}
     </div>
   </div>"""
@@ -984,27 +987,30 @@ def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
 
 
 def build_quote_motivation(data: dict, photo_b64: str) -> str:
-    quote_en  = data.get("quote_en", "")
-    author    = data.get("author", "").strip()
-    quote_ua  = data.get("quote_ua", "")
-    ts = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    quote_en = data.get("quote_en", "")
+    author   = data.get("author", "").strip()
+    quote_ua = data.get("quote_ua", "")
+    ts_strong = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    ts_soft   = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
-    # Показуємо автора тільки якщо він відомий (не Unknown, не порожній)
     show_author = author and author.lower() not in ("unknown", "невідомо", "")
-    author_line = f'<div style="font-size:50px; font-weight:700; color:rgba(255,255,255,0.95); margin-top:22px; text-align:right; {ts}">— {author}</div>' if show_author else ""
+    author_line = f'''<div style="font-size:50px; font-weight:600; font-style:italic;
+                           color:rgba(255,230,150,0.95); margin-top:24px;
+                           text-align:right; {ts_strong}">
+                      — {author}</div>''' if show_author else ""
 
     blocks = f"""
-  <div class="glass-block">
+  <div class="glass-block" style="padding: 72px 56px;">
     <div style="font-size:clamp(56px,6vw,72px); font-weight:800; color:#ffffff;
-                {ts} line-height:1.3;">
-      "{quote_en}"
+                {ts_strong} line-height:1.3;">
+      \"{quote_en}\"
     </div>
     {author_line}
   </div>
-  <div class="glass-block">
-    <div style="font-size:58px; font-weight:400; color:rgba(255,255,255,0.93);
-                {ts} line-height:1.35; text-align:left;">
-      "{quote_ua}"
+  <div class="glass-block" style="padding: 52px 56px;">
+    <div style="font-size:58px; font-weight:400; color:rgba(220,235,255,0.95);
+                {ts_soft} line-height:1.35; text-align:left;">
+      \"{quote_ua}\"
     </div>
   </div>"""
     return html_base(photo_b64, "Quote", blocks)
