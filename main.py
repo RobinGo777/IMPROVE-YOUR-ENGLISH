@@ -875,7 +875,7 @@ body {{
   position: absolute;
   top: 56px;
   right: 56px;
-  background: rgba(30, 30, 30, 0.75);
+  background: rgba(30, 30, 30, 0.65);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border-radius: 50px;
@@ -1013,7 +1013,7 @@ def build_quote_motivation(data: dict, photo_b64: str) -> str:
   </div>
   <div class="glass-block" style="height:480px; padding:56px; display:flex;
        align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:clamp(52px,5.5vw,68px); font-weight:400; color:rgba(255,255,255,0.90);
+    <div style="font-size:clamp(52px,5.5vw,68px); font-weight:800; color:rgba(255,255,255,0.90);
                 {ts_soft} line-height:1.3; text-align:left;">
       \"{quote_ua}\"
     </div>
