@@ -1196,6 +1196,23 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
         photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
         log.info(f"✅ Photo ready for [{rubric}]: {len(photo_bytes)//1024}KB")
 
+        # 3. Генеруємо контент
+        history = await history_mgr.get_used(rubric)
+        log.info(f"🤖 Generating content for [{rubric}]...")
+        data = await generate_content(rubric, history, extra)
+        log.info(f"✅ Content: {json.dumps(data, ensure_ascii=False)[:200]}")
+
+        # Якщо Gemini повернув кращий photo_query — оновлюємо фото
+        ai_photo_query = data.get("photo_query", "").strip()
+        if ai_photo_query and ai_photo_query != photo_query:
+            log.info(f"🎨 AI photo query: '{ai_photo_query}' — fetching better photo")
+            better_url = await fetch_photo(ai_photo_query, use_topics=use_topics)
+            if better_url:
+                better_bytes = await download_photo(better_url)
+                if better_bytes:
+                    photo_b64 = base64.b64encode(better_bytes).decode("utf-8")
+                    log.info(f"✅ Better photo loaded: {len(better_bytes)//1024}KB")
+
         # 4. Будуємо HTML
         if rubric == "daily_phrase":
             html = build_daily_phrase(data, photo_b64)
