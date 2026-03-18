@@ -682,7 +682,7 @@ Return ONLY valid JSON, no markdown, no extra text:
   "quote_en": "the quote in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
   "author": "author name (or 'Unknown' if not known)",
   "quote_ua": "Ukrainian translation (natural, not word-for-word)",
-  "photo_query": "3-5 keywords for nature/landscape stock photo: always use nature, forest, mountains, ocean or sky scenes + style (minimal aesthetic cinematic soft light)"
+  "photo_query": "3-5 keywords for dark moody nature photo: forest, mountains, ocean, waterfall or green nature (NO sunrise, NO sunset, NO cities) + style (moody dramatic cinematic)"
 }}
 Rules:
 - Minimum 6 words — NEVER generate quotes like 'Just do it', 'Dream big', 'Stay strong' (too short)
@@ -690,7 +690,7 @@ Rules:
 - Simple A2 vocabulary, memorable
 - Good examples: 'The expert in anything was once a beginner.' (9 words)
 - Self-Correction: Make sure the quote is at least 6 words long
-- photo_query: ALWAYS use nature/landscape scenes (forest, mountains, ocean, sunrise, meadow) — never cities or people
+- photo_query: ALWAYS use dark/moody nature scenes (forest, mountains, ocean, waterfall, green nature) — never cities, people, sunrise or sunset (too bright)
 {LANGUAGE_CENSOR}"""
 
     if rubric == "grammar_quiz":
@@ -937,21 +937,21 @@ def build_daily_phrase(data: dict, photo_b64: str) -> str:
     blocks = f"""
   <div class="glass-block" style="height:250px; padding:48px 56px; display:flex;
        align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:68px; font-weight:800; color:#ffffff;
+    <div style="font-size:clamp(48px,6vw,68px); font-weight:800; color:#ffffff;
                 {ts_strong} line-height:1.2;">
       {phrase}
     </div>
   </div>
   <div class="glass-block" style="height:400px; padding:48px 56px; display:flex;
        align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:68px; font-weight:800; color:#ffffff;
+    <div style="font-size:clamp(48px,6vw,68px); font-weight:800; color:#ffffff;
                 {ts_strong} line-height:1.3;">
       {ex_en}
     </div>
   </div>
   <div class="glass-block" style="height:400px; padding:48px 56px; display:flex;
        align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:68px; font-weight:800; color:#ffffff;
+    <div style="font-size:clamp(48px,6vw,68px); font-weight:800; color:#ffffff;
                 {ts_soft} line-height:1.3;">
       {ex_ua}
     </div>
