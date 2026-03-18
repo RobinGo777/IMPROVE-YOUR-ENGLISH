@@ -682,7 +682,7 @@ Return ONLY valid JSON, no markdown, no extra text:
   "quote_en": "the quote in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
   "author": "author name (or 'Unknown' if not known)",
   "quote_ua": "Ukrainian translation (natural, not word-for-word)",
-  "photo_query": "3-5 keywords for stock photo: emotion + scene + style (minimal aesthetic cinematic soft light)"
+  "photo_query": "3-5 keywords for nature/landscape stock photo: always use nature, forest, mountains, ocean or sky scenes + style (minimal aesthetic cinematic soft light)"
 }}
 Rules:
 - Minimum 6 words — NEVER generate quotes like 'Just do it', 'Dream big', 'Stay strong' (too short)
@@ -690,6 +690,7 @@ Rules:
 - Simple A2 vocabulary, memorable
 - Good examples: 'The expert in anything was once a beginner.' (9 words)
 - Self-Correction: Make sure the quote is at least 6 words long
+- photo_query: ALWAYS use nature/landscape scenes (forest, mountains, ocean, sunrise, meadow) — never cities or people
 {LANGUAGE_CENSOR}"""
 
     if rubric == "grammar_quiz":
@@ -964,20 +965,25 @@ def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
     ts_strong  = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
     ts_soft    = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
-    # Адаптивна висота блоків під найдовшу фразу
+    # Адаптивна висота і шрифт під найдовшу фразу
     max_chars = max(
         (len(p.get("en", "")) + len(p.get("ua", "")) for p in phrases[:5]),
         default=100
     )
     if max_chars <= 80:
-        block_height = 180
+        block_height = 200
+        font_en, font_ua = 50, 44
     elif max_chars <= 120:
-        block_height = 210
+        block_height = 230
+        font_en, font_ua = 50, 44
     elif max_chars <= 160:
-        block_height = 240
+        block_height = 260
+        font_en, font_ua = 50, 44
     else:
-        block_height = 270
-    log.info(f"📐 Situation block height: {block_height}px (max_chars={max_chars})")
+        # Дуже довгі фрази — зменшуємо шрифт щоб влізло
+        block_height = 290
+        font_en, font_ua = 46, 40
+    log.info(f"📐 Situation: height={block_height}px font={font_en}/{font_ua}px max_chars={max_chars}")
 
     topic_header = f"""
   <div style="width:100%; text-align:left; padding:0 8px; margin-bottom:4px;">
@@ -994,11 +1000,11 @@ def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
         blocks += f"""
   <div class="glass-block" style="height:{block_height}px; padding:20px 48px; display:flex;
        flex-direction:column; justify-content:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:48px; font-weight:700; color:#ffffff;
+    <div style="font-size:{font_en}px; font-weight:700; color:#ffffff;
                 {ts_strong} line-height:1.2; margin-bottom:10px;">
       {en}
     </div>
-    <div style="font-size:42px; font-weight:400; color:rgba(255,255,255,0.88);
+    <div style="font-size:{font_ua}px; font-weight:400; color:rgba(255,255,255,0.88);
                 {ts_soft} line-height:1.2;">
       {ua}
     </div>
