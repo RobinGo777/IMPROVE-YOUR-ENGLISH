@@ -939,7 +939,7 @@ def build_daily_phrase(data: dict, photo_b64: str) -> str:
     ts_soft   = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
     blocks = f"""
-  <div class="glass-block" style="height:300px; padding:48px 56px; display:flex;
+  <div class="glass-block" style="height:250px; padding:48px 56px; display:flex;
        align-items:center; overflow:hidden; box-sizing:border-box;">
     <div style="font-size:68px; font-weight:800; color:#ffffff;
                 {ts_strong} line-height:1.2;">
@@ -947,7 +947,7 @@ def build_daily_phrase(data: dict, photo_b64: str) -> str:
     </div>
   </div>
   <div class="glass-block" style="height:400px; padding:48px 56px; display:flex;
-       align-items:center; overflow:hidden; box-sizing:border-box; margin-top:50px;">
+       align-items:center; overflow:hidden; box-sizing:border-box;">
     <div style="font-size:68px; font-weight:800; color:#ffffff;
                 {ts_strong} line-height:1.3;">
       {ex_en}
