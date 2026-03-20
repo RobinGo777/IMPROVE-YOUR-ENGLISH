@@ -941,7 +941,16 @@ def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
     block_height, font_en, font_ua = 280, 50, 44
     log.info(f"📐 Situation: fixed height={block_height}px")
 
-    blocks = ""
+    # Тема над блоками без розмиття
+    topic_header = f"""
+  <div style="width:100%; text-align:left; padding:0 8px; margin-bottom:4px;">
+    <div style="font-size:68px; font-weight:600; color:#c9a84c;
+                letter-spacing:2px; {ts} line-height:1.1;">
+      {topic_name}
+    </div>
+  </div>"""
+
+    blocks = topic_header
     for p in phrases[:5]:
         en = p.get("en", "")
         ua = p.get("ua", "")
@@ -957,11 +966,8 @@ def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
     html = html_base(photo_b64, blocks)
     html = html.replace("gap: 44px;", "gap: 20px;", 1)
 
-    # Bottom bar: тема зліва + бренд справа з blur
-    bottom = f'''<div class="bottom-bar" style="display:flex; justify-content:space-between; align-items:center;">
-      <div style="font-size:60px; font-weight:600; color:#c9a84c; letter-spacing:2px; {ts}">
-        {topic_name}
-      </div>
+    # Бренд в самому низу з blur
+    bottom = '''<div class="bottom-bar" style="text-align:right;">
       <span class="brand">Improve Your <span class="eng">English</span></span>
     </div>'''
     html = html.replace("</body>", bottom + "</body>")
