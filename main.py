@@ -51,9 +51,10 @@ PIXABAY_API_KEY      = os.environ.get("PIXABAY_API_KEY", "")
 # Після верифікації картки замініть на кращі моделі
 # Замініть на актуальні моделі після верифікації картки
 GEMINI_MODELS = [
-    "gemini-3.1-flash-lite",   # модель 1 — замініть
-    "gemini-3-flash",                  # модель 2 — замініть
-    "gemini-2.5-flash-lite",             # модель 3 — запасна
+    "gemini-3.1-flash-lite-preview",    # 500 RPD — основна
+    "gemini-2.5-flash-lite",            # 20 RPD — запасна
+    "gemini-2.5-flash",                 # 20 RPD — запасна
+    "gemini-2.0-flash-lite",             # модель 3 — запасна
 ]
 
 # ──────────────────────────────────────────────
@@ -675,22 +676,22 @@ Rules:
 {LANGUAGE_CENSOR}"""
 
     if rubric == "quote_motivation":
-        return f"""You are an English teacher. Find a short motivational or wise quote for A2 level English students.
+        return f"""You are an English teacher. Generate a short motivational phrase for A2 level English students.
 {history_note}
 Return ONLY valid JSON, no markdown, no extra text:
 {{
-  "quote_en": "the quote in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
-  "author": "author name (or 'Unknown' if not known)",
+  "quote_en": "motivational phrase in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
   "quote_ua": "Ukrainian translation (natural, not word-for-word)",
   "photo_query": "3-5 keywords for dark moody nature photo: forest, mountains, ocean, waterfall or green nature (NO sunrise, NO sunset, NO cities) + style (moody dramatic cinematic)"
 }}
 Rules:
-- Minimum 6 words — NEVER generate quotes like 'Just do it', 'Dream big', 'Stay strong' (too short)
+- Minimum 6 words — NEVER generate phrases like 'Just do it', 'Dream big', 'Stay strong' (too short)
 - Maximum 12 words
-- Simple A2 vocabulary, memorable
-- Good examples: 'The expert in anything was once a beginner.' (9 words)
-- Self-Correction: Make sure the quote is at least 6 words long
-- photo_query: ALWAYS use dark/moody nature scenes (forest, mountains, ocean, waterfall, green nature) — never cities, people, sunrise or sunset (too bright)
+- Simple A2 vocabulary, positive and inspiring
+- Good examples: 'Every day is a new chance to grow.' (9 words)
+- Self-Correction: Make sure the phrase is at least 6 words long
+- photo_query: ALWAYS use dark/moody nature scenes — never cities, people, sunrise or sunset
+- NO author needed — this is original motivation, not a quote
 {LANGUAGE_CENSOR}"""
 
     if rubric == "grammar_quiz":
@@ -855,74 +856,63 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
 # HTML ШАБЛОНИ — GLASSMORPHISM
 # ──────────────────────────────────────────────
 def html_base(photo_b64: str, content_blocks: str) -> str:
-    """HTML шаблон без topbar — мінімалістичний дизайн."""
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700&display=swap');
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
-  width: 1080px;
-  height: 1920px;
+  width: 1080px; height: 1920px;
   overflow: hidden;
-  font-family: 'Nunito', sans-serif;
+  font-family: 'Montserrat', sans-serif;
   position: relative;
 }}
 .bg {{
-  position: absolute;
-  top: 0; left: 0;
-  width: 1080px;
-  height: 1920px;
+  position: absolute; top: 0; left: 0;
+  width: 1080px; height: 1920px;
   background-image: url('data:image/jpeg;base64,{photo_b64}');
-  background-size: cover;
-  background-position: center;
-  z-index: 0;
+  background-size: cover; background-position: center; z-index: 0;
 }}
 .bg-overlay {{
-  position: absolute;
-  top: 0; left: 0;
-  width: 100%; height: 100%;
-  background: linear-gradient(
-    to bottom,
-    rgba(0,0,0,0.05) 0%,
-    rgba(0,0,0,0.10) 40%,
-    rgba(0,0,0,0.45) 100%
-  );
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.15) 40%, rgba(0,0,0,0.55) 100%);
   z-index: 1;
 }}
 .content {{
-  position: absolute;
-  top: 0; left: 0;
-  width: 1080px;
-  height: 1920px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  padding: 120px 64px;
-  gap: 50px;
-  z-index: 5;
+  position: absolute; top: 0; left: 0;
+  width: 1080px; height: 1920px;
+  display: flex; flex-direction: column;
+  justify-content: center; align-items: center;
+  padding: 120px 64px; gap: 50px; z-index: 5;
 }}
 .glass-block {{
   width: 100%;
-  background: rgba(200, 200, 210, 0.30);
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
-  border-radius: 32px;
-  padding: 52px 60px;
-  border: 1px solid rgba(255,255,255,0.30);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.22);
+  background: rgba(12, 12, 18, 0.58);
+  backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);
+  border-radius: 32px; padding: 52px 60px;
+  border: 1px solid rgba(201,168,76,0.25);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.30);
+}}
+.gold {{ color: #c9a84c; }}
+.brand {{
+  font-size: 36px; font-weight: 300; letter-spacing: 2px;
+  color: rgba(245,245,247,0.75);
+  text-shadow: 0 2px 8px rgba(0,0,0,0.85);
+}}
+.brand .eng {{ color: #c9a84c; }}
+.gold-line {{
+  width: 120px; height: 2px;
+  background: linear-gradient(90deg, transparent, #c9a84c, transparent);
+  margin: 28px 0;
 }}
 </style>
 </head>
 <body>
 <div class="bg"></div>
 <div class="bg-overlay"></div>
-<div class="content">
-{content_blocks}
-</div>
+<div class="content">{content_blocks}</div>
 </body>
 </html>"""
 
@@ -931,29 +921,34 @@ def build_daily_phrase(data: dict, photo_b64: str) -> str:
     phrase = data.get("phrase_en", "")
     ex_en  = data.get("example_en", "")
     ex_ua  = data.get("example_ua", "")
-    ts_strong = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
-    ts_soft   = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
+    ts  = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    ts2 = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
     blocks = f"""
-  <div class="glass-block" style="height:250px; padding:48px 56px; display:flex;
-       align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:clamp(48px,6vw,68px); font-weight:800; color:#ffffff;
-                {ts_strong} line-height:1.2;">
+  <div class="glass-block" style="height:350px; padding:52px 60px; display:flex;
+       flex-direction:column; justify-content:flex-start; overflow:hidden; box-sizing:border-box;">
+    <div style="font-size:36px; font-weight:600; letter-spacing:3px; color:#c9a84c;
+                text-transform:uppercase; margin-bottom:32px; {ts}">
+      Daily Phrase
+    </div>
+    <div style="font-size:clamp(46px,5vw,64px); font-weight:700; color:#ffffff;
+                {ts} line-height:1.25; flex:1; display:flex; align-items:center;">
       {phrase}
     </div>
   </div>
-  <div class="glass-block" style="height:400px; padding:48px 56px; display:flex;
-       align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:clamp(48px,6vw,68px); font-weight:800; color:#ffffff;
-                {ts_strong} line-height:1.3;">
+  <div class="glass-block" style="height:520px; padding:52px 60px; display:flex;
+       flex-direction:column; justify-content:center; overflow:hidden; box-sizing:border-box;">
+    <div style="font-size:clamp(42px,4.5vw,58px); font-weight:600; color:#ffffff;
+                {ts} line-height:1.3; margin-bottom:4px;">
       {ex_en}
     </div>
-  </div>
-  <div class="glass-block" style="height:400px; padding:48px 56px; display:flex;
-       align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:clamp(48px,6vw,68px); font-weight:800; color:#ffffff;
-                {ts_soft} line-height:1.3;">
+    <div class="gold-line"></div>
+    <div style="font-size:clamp(40px,4.3vw,56px); font-weight:300; color:rgba(245,245,247,0.85);
+                {ts2} line-height:1.3; flex:1; display:flex; align-items:center;">
       {ex_ua}
+    </div>
+    <div style="text-align:right; margin-top:24px;">
+      <span class="brand">Improve Your <span class="eng">English</span></span>
     </div>
   </div>"""
     return html_base(photo_b64, blocks)
@@ -962,33 +957,27 @@ def build_daily_phrase(data: dict, photo_b64: str) -> str:
 def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
     phrases    = data.get("phrases", [])
     topic_name = category.get("name", "")
-    ts_strong  = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
-    ts_soft    = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
+    ts  = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    ts2 = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
-    # Адаптивна висота і шрифт під найдовшу фразу
     max_chars = max(
         (len(p.get("en", "")) + len(p.get("ua", "")) for p in phrases[:5]),
         default=100
     )
     if max_chars <= 80:
-        block_height = 200
-        font_en, font_ua = 50, 44
+        block_height, font_en, font_ua = 200, 50, 44
     elif max_chars <= 120:
-        block_height = 230
-        font_en, font_ua = 50, 44
+        block_height, font_en, font_ua = 230, 50, 44
     elif max_chars <= 160:
-        block_height = 260
-        font_en, font_ua = 50, 44
+        block_height, font_en, font_ua = 260, 50, 44
     else:
-        # Дуже довгі фрази — зменшуємо шрифт щоб влізло
-        block_height = 290
-        font_en, font_ua = 46, 40
+        block_height, font_en, font_ua = 290, 46, 40
     log.info(f"📐 Situation: height={block_height}px font={font_en}/{font_ua}px max_chars={max_chars}")
 
     topic_header = f"""
   <div style="width:100%; text-align:left; padding:0 8px; margin-bottom:4px;">
-    <div style="font-size:68px; font-weight:800; color:rgba(255,245,200,0.95);
-                {ts_strong} line-height:1.1;">
+    <div style="font-size:68px; font-weight:600; color:#c9a84c;
+                letter-spacing:2px; {ts} line-height:1.1;">
       {topic_name}
     </div>
   </div>"""
@@ -1001,47 +990,51 @@ def build_situation_phrases(data: dict, photo_b64: str, category: dict) -> str:
   <div class="glass-block" style="height:{block_height}px; padding:20px 48px; display:flex;
        flex-direction:column; justify-content:center; overflow:hidden; box-sizing:border-box;">
     <div style="font-size:{font_en}px; font-weight:700; color:#ffffff;
-                {ts_strong} line-height:1.2; margin-bottom:10px;">
-      {en}
-    </div>
-    <div style="font-size:{font_ua}px; font-weight:400; color:rgba(255,255,255,0.88);
-                {ts_soft} line-height:1.2;">
-      {ua}
-    </div>
+                {ts} line-height:1.2; margin-bottom:10px;">{en}</div>
+    <div style="font-size:{font_ua}px; font-weight:300; color:rgba(245,245,247,0.82);
+                {ts2} line-height:1.2;">{ua}</div>
+  </div>"""
+
+    # Бренд внизу поза блоками
+    blocks += f"""
+  <div style="width:100%; text-align:right; padding:0 8px;">
+    <span class="brand">Improve Your <span class="eng">English</span></span>
   </div>"""
 
     html = html_base(photo_b64, blocks)
-    html = html.replace("gap: 50px;", "gap: 25px;", 1)
+    html = html.replace("gap: 50px;", "gap: 22px;", 1)
     return html
 
 
 def build_quote_motivation(data: dict, photo_b64: str) -> str:
     quote_en = data.get("quote_en", "")
-    author   = data.get("author", "").strip()
     quote_ua = data.get("quote_ua", "")
-    ts_strong = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
-    ts_soft   = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
-
-    show_author = author and author.lower() not in ("unknown", "невідомо", "")
-    author_line = f'''<div style="font-size:50px; font-weight:600; font-style:italic;
-                           color:rgba(255,230,150,0.95); margin-top:24px;
-                           text-align:right; {ts_strong}">
-                      — {author}</div>''' if show_author else ""
+    ts  = "text-shadow: 0 2px 8px rgba(0,0,0,0.85), 0 1px 3px rgba(0,0,0,0.95);"
+    ts2 = "text-shadow: 0 2px 6px rgba(0,0,0,0.75), 0 1px 3px rgba(0,0,0,0.85);"
 
     blocks = f"""
-  <div class="glass-block" style="height:480px; padding:56px; display:flex;
-       flex-direction:column; justify-content:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:clamp(52px,5.5vw,68px); font-weight:800; color:#ffffff;
-                {ts_strong} line-height:1.3;">
-      \"{quote_en}\"
+  <div class="glass-block" style="height:480px; padding:52px 60px; display:flex;
+       flex-direction:column; justify-content:flex-start; overflow:hidden; box-sizing:border-box;">
+    <div style="font-size:36px; font-weight:600; letter-spacing:3px; color:#c9a84c;
+                text-transform:uppercase; margin-bottom:32px; {ts}">
+      Daily Motivation
     </div>
-    {author_line}
+    <div style="font-size:clamp(46px,5vw,64px); font-weight:700; color:#ffffff;
+                {ts} line-height:1.3; flex:1; display:flex; align-items:center;">
+      {quote_en}
+    </div>
   </div>
-  <div class="glass-block" style="height:480px; padding:56px; display:flex;
-       align-items:center; overflow:hidden; box-sizing:border-box;">
-    <div style="font-size:clamp(52px,5.5vw,68px); font-weight:800; color:#ffffff;
-                {ts_soft} line-height:1.3; text-align:left;">
-      \"{quote_ua}\"
+  <div style="display:flex; justify-content:center; width:100%;">
+    <div class="gold-line"></div>
+  </div>
+  <div class="glass-block" style="height:480px; padding:52px 60px; display:flex;
+       flex-direction:column; justify-content:center; overflow:hidden; box-sizing:border-box;">
+    <div style="font-size:clamp(46px,5vw,64px); font-weight:300; color:rgba(245,245,247,0.88);
+                {ts2} line-height:1.3; flex:1; display:flex; align-items:center;">
+      {quote_ua}
+    </div>
+    <div style="text-align:right; margin-top:24px;">
+      <span class="brand">Improve Your <span class="eng">English</span></span>
     </div>
   </div>"""
     return html_base(photo_b64, blocks)
@@ -1097,6 +1090,11 @@ async def send_photo_to_telegram(png_bytes: bytes, rubric: str) -> bool:
 
 async def send_quiz_to_telegram(data: dict, rubric: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
+
+    # Gemini Flash Lite іноді повертає список замість об'єкта
+    if isinstance(data, list):
+        log.warning(f"⚠️ Quiz data is list, taking first element for [{rubric}]")
+        data = data[0] if data else {}
 
     question   = data.get("question", "")
     options    = data.get("options", [])
