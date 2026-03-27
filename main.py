@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from datetime import datetime, date
 from io import BytesIO
@@ -16,6 +17,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from playwright.async_api import async_playwright
+
+# ──────────────────────────────────────────────
+# КОНФІГУРАЦІЯ / ВАЛІДАЦІЯ
+# ──────────────────────────────────────────────
+def _get_required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
 # ──────────────────────────────────────────────
 # НАЛАШТУВАННЯ ЛОГІВ
@@ -30,8 +40,8 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # ЗМІННІ СЕРЕДОВИЩА
 # ──────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID     = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 # Три Gemini ключі з різних Google акаунтів — незалежні квоти
 GEMINI_API_KEYS = [
     os.environ.get("GEMINI_API_KEY_1", ""),
@@ -244,6 +254,21 @@ ATMOSPHERE_PHOTOS = [
     "architectural minimal concrete geometry",
 ]
 
+DAILY_PHRASE_STYLE_PHOTOS = [
+    "minimal cozy interior warm sunlight",
+    "soft morning light wall shadow minimal",
+    "beige aesthetic room calm atmosphere",
+    "coffee table warm light minimal",
+    "clean living room neutral tones cinematic",
+    "warm window light cozy interior",
+    "minimal bedroom soft shadows calm",
+    "scandinavian interior warm beige aesthetic",
+    "minimal home workspace warm soft light",
+    "calm neutral interior soft golden light",
+    "cozy armchair warm natural window light",
+    "minimal apartment interior soft cinematic mood",
+]
+
 QUOTE_PHOTOS = [
     "misty forest sunbeams dramatic golden moody",
     "mountain peak sunrise alpenglow dramatic",
@@ -252,6 +277,44 @@ QUOTE_PHOTOS = [
     "waterfall long exposure nature",
     "starry sky milky way mountains",
 ]
+
+QUOTE_THEMES = [
+    {
+        "name": "Stoicism & Resilience",
+        "description": "Focus on what we can control, strength in difficulty, obstacles into opportunities.",
+    },
+    {
+        "name": "Deep Action & Discipline",
+        "description": "Act today, action over overthinking, daily consistency and compounding habits.",
+    },
+    {
+        "name": "Self-Actualization",
+        "description": "Authenticity, courage to be yourself, develop unique talents, ignore social noise.",
+    },
+    {
+        "name": "Mindfulness & Presence",
+        "description": "Living in the present, gratitude, mental hygiene, less anxiety about future.",
+    },
+    {
+        "name": "Intellectual Growth",
+        "description": "Love of learning, curiosity, language as a tool to understand the world.",
+    },
+    {
+        "name": "Contribution & Impact",
+        "description": "Helping others, personal growth that improves the world around you.",
+    },
+]
+
+WEAK_QUOTE_PATTERNS = (
+    "just do it",
+    "dream big",
+    "stay strong",
+    "never give up",
+    "keep going",
+    "believe in yourself",
+    "be positive",
+    "you can do it",
+)
 
 
 def get_season(month: int) -> str:
@@ -288,6 +351,34 @@ def get_photo_query_for_daily_phrase() -> str:
         query = random.choice(ATMOSPHERE_PHOTOS)
         log.info(f"☁️ Atmosphere photo → {query}")
         return query
+
+
+async def get_daily_phrase_photo_query(history_mgr) -> str:
+    """Повертає стилізований фон daily_phrase без швидких повторів."""
+    holiday = get_today_holiday()
+    if holiday:
+        log.info(f"🎉 Holiday detected: {holiday['name']}")
+        return holiday["photo_query"]
+
+    key = "used:daily_phrase_photo_queries"
+    try:
+        used_raw = await history_mgr.r.lrange(key, 0, -1)
+        used_set = set(used_raw or [])
+        available = [q for q in DAILY_PHRASE_STYLE_PHOTOS if q not in used_set]
+        if not available:
+            log.info("🔄 Daily phrase style photos exhausted — resetting rotation")
+            await history_mgr.r.delete(key)
+            available = DAILY_PHRASE_STYLE_PHOTOS
+
+        query = random.choice(available)
+        await history_mgr.r.lpush(key, query)
+        await history_mgr.r.ltrim(key, 0, len(DAILY_PHRASE_STYLE_PHOTOS) - 1)
+        log.info(f"🎨 Daily phrase curated photo query: {query}")
+        return query
+    except Exception as e:
+        fallback = random.choice(DAILY_PHRASE_STYLE_PHOTOS)
+        log.error(f"❌ get_daily_phrase_photo_query error: {e} — fallback '{fallback}'")
+        return fallback
 
 
 def get_photo_query_for_situation(category: dict) -> str:
@@ -327,15 +418,16 @@ async def get_daily_phrase_topic(history_mgr) -> dict:
 # ──────────────────────────────────────────────
 class UpstashRedis:
     def __init__(self):
-        self.url   = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
-        self.token = os.environ["UPSTASH_REDIS_REST_TOKEN"]
+        self.url   = _get_required_env("UPSTASH_REDIS_REST_URL").rstrip("/")
+        self.token = _get_required_env("UPSTASH_REDIS_REST_TOKEN")
         self.headers = {"Authorization": f"Bearer {self.token}"}
 
     async def _cmd(self, *args):
-        cmd_url = self.url + "/" + "/".join(str(a) for a in args)
+        payload = [str(a) for a in args]
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(cmd_url, headers=self.headers)
+                # JSON payload надійніше за URL-параметри для спецсимволів.
+                resp = await client.post(self.url, headers=self.headers, json=payload)
                 resp.raise_for_status()
                 return resp.json().get("result")
         except Exception as e:
@@ -441,6 +533,26 @@ class HistoryManager:
             log.info(f"🔄 Situation index advanced: {current} → {next_idx}")
         except Exception as e:
             log.error(f"❌ Redis advance_situation_index error: {e}")
+
+    async def get_quote_theme_index(self) -> int:
+        try:
+            val = await self.r.get("quote:theme_rotation_index")
+            idx = int(val) if val is not None else 0
+            idx = idx % len(QUOTE_THEMES)
+            log.info(f"🧭 Quote theme index: {idx}")
+            return idx
+        except Exception as e:
+            log.error(f"❌ Redis get_quote_theme_index error: {e} — using index 0")
+            return 0
+
+    async def advance_quote_theme_index(self):
+        try:
+            current = await self.get_quote_theme_index()
+            next_idx = (current + 1) % len(QUOTE_THEMES)
+            await self.r.set("quote:theme_rotation_index", str(next_idx))
+            log.info(f"🧭 Quote theme index advanced: {current} → {next_idx}")
+        except Exception as e:
+            log.error(f"❌ Redis advance_quote_theme_index error: {e}")
 
 # ──────────────────────────────────────────────
 # ФОТО API
@@ -674,22 +786,40 @@ Rules:
 {LANGUAGE_CENSOR}"""
 
     if rubric == "quote_motivation":
-        return f"""You are an English teacher. Generate a short motivational phrase for A2 level English students.
+        theme_name = extra.get("quote_theme_name", "Stoicism & Resilience")
+        theme_description = extra.get("quote_theme_description", "Focus on what we can control and keep moving.")
+        return f"""System role:
+You are a philosophical coach and mentor. Your task is to create deep motivational texts that combine stoicism, modern psychology, and strategic thinking.
+
+Task:
+Find a short motivational or wise quote for A2 level English students.
+Selected theme for this post (mandatory):
+- {theme_name}: {theme_description}
 {history_note}
 Return ONLY valid JSON, no markdown, no extra text:
 {{
-  "quote_en": "motivational phrase in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
+  "quote_en": "the quote in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
   "quote_ua": "Ukrainian translation (natural, not word-for-word)",
-  "photo_query": "3-5 keywords for nature photo: forest, mountains, ocean, waterfall or green nature (NO sunrise, NO sunset, NO cities) + style (moody)"
+  "photo_query": "3-6 keywords for green nature photo: forest, moss, valley, mountain lake, fog, rain atmosphere; only nature, no people, no city; style: moody cinematic"
 }}
 Rules:
-- Minimum 6 words — NEVER generate phrases like 'Just do it', 'Dream big', 'Stay strong' (too short)
+- Minimum 6 words — NEVER generate quotes like 'Just do it', 'Dream big', 'Stay strong' (too short)
 - Maximum 12 words
-- Simple A2 vocabulary, positive and inspiring
-- Good examples: 'Every day is a new chance to grow.' (9 words)
+- Simple A2 vocabulary, memorable
+- Good examples: 'The expert in anything was once a beginner.' (9 words)
 - Self-Correction: Make sure the phrase is at least 6 words long
-- photo_query: ALWAYS use dark/moody nature scenes — never cities, people, sunrise or sunset
-- NO author needed — this is original motivation, not a quote
+- Tone of voice:
+  - Intellectual depth: avoid toxic positivity and empty motivation; prefer reflective, meaningful truths
+  - Aesthetic brevity: every word must carry weight; no filler, no redundancy
+  - Ambivalence: combine disciplined action with deep self-respect and inner calm
+  - Bilingual quality: quote_en is the original in English; quote_ua is an artistic, natural Ukrainian rendering (not literal translation)
+- The quote MUST match the selected theme for this post
+- Prefer practical, grounded ideas over generic slogans
+- Avoid cliches, toxic positivity, and vague lines without concrete meaning
+- Include ONLY one quote (not a list), and keep it original in wording
+- photo_query: prioritize green nature mood (forest, moss, valley, mountain lake, fog, rain, deep greenery)
+- photo_query: ONLY nature landscapes, NO people, NO urban/city elements
+- Good photo_query examples: "misty green forest cinematic", "mossy forest path fog moody", "emerald mountain lake overcast"
 {LANGUAGE_CENSOR}"""
 
     if rubric == "grammar_quiz":
@@ -777,6 +907,46 @@ def is_critical_error(error_text: str) -> bool:
     return False
 
 
+def _normalize_quote_text(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9а-щьюяєіїґ\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def validate_quote_motivation(data: dict, used_history: list) -> tuple[bool, str]:
+    quote_en = str(data.get("quote_en", "")).strip()
+    quote_ua = str(data.get("quote_ua", "")).strip()
+    photo_query = str(data.get("photo_query", "")).strip()
+
+    if not quote_en or not quote_ua or not photo_query:
+        return False, "missing required fields"
+
+    words = [w for w in quote_en.split() if w.strip()]
+    if len(words) < 6 or len(words) > 12:
+        return False, f"word count out of range ({len(words)})"
+
+    quote_norm = _normalize_quote_text(quote_en)
+    if any(pattern in quote_norm for pattern in WEAK_QUOTE_PATTERNS):
+        return False, "contains weak cliche phrase"
+
+    if len(quote_ua) < 12:
+        return False, "ukrainian translation too short"
+    if quote_en.lower() == quote_ua.lower():
+        return False, "translation equals english text"
+
+    if len(photo_query.split()) < 3:
+        return False, "photo_query too short"
+    if len(photo_query) > 140:
+        return False, "photo_query too long"
+
+    recent_norm = [_normalize_quote_text(item) for item in used_history[-25:]]
+    if quote_norm and any(quote_norm in h or h in quote_norm for h in recent_norm if h):
+        return False, "too similar to recent history"
+
+    return True, "ok"
+
+
 async def call_gemini(api_key: str, prompt: str, model: str = "gemini-2.0-flash-lite") -> dict:
     """Викликає Gemini модель з конкретним API ключем."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -849,6 +1019,26 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
 
     log.error(f"❌ All Gemini models+keys failed for [{rubric}] — SKIPPING POST")
     raise RuntimeError(f"All Gemini models failed for [{rubric}]")
+
+
+async def generate_quote_motivation_content(history: list, extra: dict = None, max_attempts: int = 3) -> dict:
+    theme_name = (extra or {}).get("quote_theme_name", "unknown")
+    log.info(f"📣 [NF] quote_motivation generation started | theme='{theme_name}' | max_attempts={max_attempts}")
+    for attempt in range(1, max_attempts + 1):
+        data = await generate_content("quote_motivation", history, extra)
+        is_valid, reason = validate_quote_motivation(data, history)
+        if is_valid:
+            if attempt > 1:
+                log.info(f"✅ quote_motivation validated on retry #{attempt}")
+            log.info(f"📣 [NF] quote_motivation accepted | theme='{theme_name}' | attempt={attempt}")
+            return data
+
+        rejected = str(data.get("quote_en", "")).strip()[:120]
+        log.warning(f"⚠️ quote_motivation rejected (attempt {attempt}/{max_attempts}): {reason} | quote='{rejected}'")
+        log.warning(f"📣 [NF] quote_motivation rejected | theme='{theme_name}' | attempt={attempt} | reason='{reason}'")
+        history = history + [rejected]
+
+    raise RuntimeError(f"quote_motivation failed validation after {max_attempts} attempts")
 
 # ──────────────────────────────────────────────
 # HTML ШАБЛОНИ — GLASSMORPHISM
@@ -1065,6 +1255,39 @@ async def send_quiz_to_telegram(data: dict, rubric: str) -> bool:
     correct    = data.get("correct_index", 0)
     explanation = data.get("explanation_ua", "")
 
+    if not isinstance(question, str):
+        log.error(f"❌ Quiz question has invalid type for [{rubric}]")
+        return False
+    question = question.strip()
+
+    if not isinstance(options, list):
+        log.error(f"❌ Quiz options invalid type for [{rubric}]: {type(options)}")
+        return False
+    options = [str(opt).strip() for opt in options if str(opt).strip()]
+
+    if not isinstance(correct, int):
+        log.error(f"❌ Quiz correct_index invalid type for [{rubric}]: {type(correct)}")
+        return False
+
+    if not isinstance(explanation, str):
+        explanation = str(explanation)
+    explanation = explanation.strip()
+
+    if not question or len(question) > 300:
+        log.error(f"❌ Quiz question invalid length for [{rubric}]: len={len(question)}")
+        return False
+    if len(options) != 4:
+        log.error(f"❌ Quiz options count must be 4 for [{rubric}], got={len(options)}")
+        return False
+    if any(len(opt) > 100 for opt in options):
+        log.error(f"❌ Quiz option too long for [{rubric}]")
+        return False
+    if correct < 0 or correct >= len(options):
+        log.error(f"❌ Quiz correct_index out of range for [{rubric}]: {correct}")
+        return False
+    if len(explanation) > 200:
+        explanation = explanation[:200]
+
     if not question or not options or len(options) < 2:
         log.error(f"❌ Quiz data invalid for [{rubric}]: question='{question}' options={options}")
         return False
@@ -1117,7 +1340,7 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
         category = None
 
         if rubric == "daily_phrase":
-            photo_query = get_photo_query_for_daily_phrase()
+            photo_query = await get_daily_phrase_photo_query(history_mgr)
             daily_topic = await get_daily_phrase_topic(history_mgr)
             extra = {"topic_name": daily_topic["name"], "topic_desc": daily_topic["desc"]}
 
@@ -1146,6 +1369,14 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
                 await history_mgr.advance_situation_index()
 
         elif rubric == "quote_motivation":
+            theme_idx = await history_mgr.get_quote_theme_index()
+            theme = QUOTE_THEMES[theme_idx]
+            extra = {
+                "quote_theme_name": theme["name"],
+                "quote_theme_description": theme["description"],
+            }
+            log.info(f"🧭 quote_motivation selected theme: {theme['name']}")
+            log.info(f"📣 [NF] quote_motivation theme selected | index={theme_idx} | name='{theme['name']}'")
             photo_query = get_photo_query_for_quote()
 
         log.info(f"🔍 Photo query for [{rubric}]: '{photo_query}'")
@@ -1169,7 +1400,10 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
         # 3. Генеруємо контент
         history = await history_mgr.get_used(rubric)
         log.info(f"🤖 Generating content for [{rubric}]...")
-        data = await generate_content(rubric, history, extra)
+        if rubric == "quote_motivation":
+            data = await generate_quote_motivation_content(history, extra, max_attempts=3)
+        else:
+            data = await generate_content(rubric, history, extra)
         log.info(f"✅ Content: {json.dumps(data, ensure_ascii=False)[:200]}")
 
         # Якщо Gemini повернув кращий photo_query — оновлюємо фото
@@ -1207,6 +1441,11 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
         if success:
             history_key = json.dumps(data, ensure_ascii=False)[:100]
             await history_mgr.add_used(rubric, history_key)
+            if rubric == "quote_motivation":
+                theme_name = extra.get("quote_theme_name", "unknown")
+                quote_preview = str(data.get("quote_en", "")).strip()[:120]
+                log.info(f"📣 [NF] quote_motivation published | theme='{theme_name}' | quote='{quote_preview}'")
+                await history_mgr.advance_quote_theme_index()
 
         elapsed = time.time() - start_time
         log.info(f"⏱️ [{rubric}] completed in {elapsed:.1f}s | success={success}")
@@ -1355,6 +1594,9 @@ async def scheduler(redis_client: UpstashRedis):
 # ──────────────────────────────────────────────
 async def main():
     global _redis_client_global, _loop_global
+
+    _get_required_env("TELEGRAM_BOT_TOKEN")
+    _get_required_env("TELEGRAM_CHAT_ID")
 
     log.info("🤖 English A2 Bot v2.0 starting...")
     log.info(f"📋 Schedule: {SCHEDULE}")
