@@ -1408,6 +1408,11 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
 
         # Якщо Gemini повернув кращий photo_query — оновлюємо фото
         ai_photo_query = data.get("photo_query", "").strip()
+        # Для daily_phrase тримаємо curated-стиль, тому AI photo_query не застосовуємо.
+        if rubric == "daily_phrase" and ai_photo_query and ai_photo_query != photo_query:
+            log.info(f"🎨 Daily phrase: skip AI photo query to keep curated style | ai='{ai_photo_query}'")
+            ai_photo_query = ""
+
         if ai_photo_query and ai_photo_query != photo_query:
             log.info(f"🎨 AI photo query: '{ai_photo_query}' — fetching better photo")
             better_url = await fetch_photo(ai_photo_query, use_topics=use_topics)
