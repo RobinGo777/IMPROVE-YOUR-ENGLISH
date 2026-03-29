@@ -117,6 +117,9 @@ TRAVEL_VIDEO_BRAND_SEC = 2.5
 TRAVEL_VIDEO_PIPELINE_ATTEMPTS = 3
 TRAVEL_VIDEO_NARRATION_WORDS_MAX = 160
 
+INTERESTING_CITIES_SENTENCES_MIN = 5
+INTERESTING_CITIES_SENTENCES_MAX = 7
+
 PLACEHOLDER_RUBRICS = frozenset()
 
 
@@ -2869,7 +2872,9 @@ Your style:
 — as if you're texting a friend, not selling a tour
 — no dry facts, years, or dates; no encyclopaedic tone
 
-Task: write ONE post about ONE place — it can be a city, a small town, or a capital.
+Task: write ONE short post about ONE place — a city, a small town, or a capital. The whole story must fit in **{INTERESTING_CITIES_SENTENCES_MIN} to {INTERESTING_CITIES_SENTENCES_MAX} sentences** total (count only the sentences in "sentences").
+
+Suggested flow inside those sentences (still one sentence each): a hook → what feels special → one or two concrete places or moments → a personal reaction → a light ending or question. Keep each sentence fairly short.
 
 {banned_note}{history_note}
 Return ONLY valid JSON, no markdown, no extra text:
@@ -2877,24 +2882,17 @@ Return ONLY valid JSON, no markdown, no extra text:
   "city_name": "English name of the place",
   "country": "English name of the country",
   "photo_query": "compact English keywords for stock photo search (place + country + one visual cue; avoid keyword spam)",
-  "hook": "Short emotional hook: 1–2 sentences only.",
-  "what_makes_it_special": "One paragraph: what feels special here — concrete and fresh, not generic.",
-  "experiences": [
-    "Each string: one specific place, moment, or thing to do — natural sentences, 2 to 4 strings total.",
-    "Another experience..."
-  ],
-  "personal_note": "A small personal reaction or feeling (one short paragraph).",
-  "closing": "A light ending OR a simple question to the reader (one short paragraph)."
+  "sentences": [
+    "Exactly {INTERESTING_CITIES_SENTENCES_MIN} to {INTERESTING_CITIES_SENTENCES_MAX} strings; each string is ONE complete sentence in English.",
+    "Second sentence...",
+    "... up to {INTERESTING_CITIES_SENTENCES_MAX} sentences total."
+  ]
 }}
-Structure:
-— The Telegram caption title line will be: city_name + country (no extra title field).
-— "experiences" must contain between 2 and 4 non-empty strings. Do NOT prefix lines with "1." "2." or bullets; write full sentences only.
-— Flow: hook → what_makes_it_special → experiences (each string is its own mini-bit) → personal_note → closing.
-
 Rules:
+- The "sentences" array MUST have length {INTERESTING_CITIES_SENTENCES_MIN}, {INTERESTING_CITIES_SENTENCES_MAX}, or any integer in between (e.g. 6 is allowed). Never fewer than {INTERESTING_CITIES_SENTENCES_MIN} or more than {INTERESTING_CITIES_SENTENCES_MAX}.
 - English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols.
-- Natural spoken English (B1-ish): mix of short and medium sentences; still clear for learners — avoid rare jargon.
-- No numbered lists inside any string (no "1.", "2.", "First:", "Second:" as list markers).
+- Natural spoken English (B1-ish): clear for learners; avoid rare jargon.
+- No numbered list markers in the text (no "1.", "2." at the start of a sentence).
 - Pick ONE interesting place anywhere in the world — vary continents over time. Be specific.
 - "photo_query": keywords for a strong photo of THAT place (Unsplash/Pexels/Pixabay).
 - Do not repeat places from the banned list above."""
@@ -3258,7 +3256,7 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
     elif rubric == "photo_relax":
         max_tok = 1000
     elif rubric == "interesting_cities":
-        max_tok = 2200
+        max_tok = 1600
     elif rubric == "travel_video_landmark":
         max_tok = 2200
     else:
@@ -3444,16 +3442,23 @@ def _interesting_cities_place_key(city: str, country: str) -> str:
     return _normalize_text(f"{city.strip()}|{country.strip()}")
 
 
+def _normalize_interesting_cities_sentences(data: dict) -> list[str] | None:
+    raw = data.get("sentences")
+    if not isinstance(raw, list):
+        return None
+    out = [str(x).strip() for x in raw]
+    out = [x for x in out if x]
+    n = len(out)
+    if n < INTERESTING_CITIES_SENTENCES_MIN or n > INTERESTING_CITIES_SENTENCES_MAX:
+        return None
+    return out
+
+
 def build_interesting_cities_signature(data: dict) -> str:
     city = str(data.get("city_name", "")).strip()
     country = str(data.get("country", "")).strip()
-    hook = str(data.get("hook", "")).strip()
-    special = str(data.get("what_makes_it_special", "")).strip()
-    exp = data.get("experiences") or []
-    exp_s = " ".join(str(x).strip() for x in exp if str(x).strip())
-    note = str(data.get("personal_note", "")).strip()
-    closing = str(data.get("closing", "")).strip()
-    body = f"{hook} | {special} | {exp_s} | {note} | {closing}"
+    sents = _normalize_interesting_cities_sentences(data)
+    body = " ".join(sents) if sents else ""
     return _normalize_text(f"{city}|{country}|{body}")[:400]
 
 
@@ -3473,46 +3478,18 @@ def validate_interesting_cities(
     if not pq:
         pq = f"{city} {country} city travel landscape architecture"
     data["photo_query"] = pq
-    hook = str(data.get("hook", "")).strip()
-    what_special = str(data.get("what_makes_it_special", "")).strip()
-    experiences = data.get("experiences")
-    personal_note = str(data.get("personal_note", "")).strip()
-    closing = str(data.get("closing", "")).strip()
-    if not hook:
-        return False, "empty hook"
-    if not what_special:
-        return False, "empty what_makes_it_special"
-    if not personal_note:
-        return False, "empty personal_note"
-    if not closing:
-        return False, "empty closing"
-    if not isinstance(experiences, list):
-        return False, "experiences must be a list"
-    experiences = [str(x).strip() for x in experiences if str(x).strip()]
-    if not (2 <= len(experiences) <= 4):
-        return False, "experiences must have 2–4 items"
+    sents = _normalize_interesting_cities_sentences(data)
+    if not sents:
+        return (
+            False,
+            f"sentences[] must have {INTERESTING_CITIES_SENTENCES_MIN}–{INTERESTING_CITIES_SENTENCES_MAX} non-empty items",
+        )
     cy = re.compile(r"[\u0400-\u04FF]")
-    if len(hook) > 500:
-        return False, "hook too long"
-    if len(what_special) > 700:
-        return False, "what_makes_it_special too long"
-    if len(personal_note) > 400:
-        return False, "personal_note too long"
-    if len(closing) > 400:
-        return False, "closing too long"
-    for i, s in enumerate(experiences):
-        if len(s) > 450:
-            return False, f"experience {i+1} too long"
+    for i, s in enumerate(sents):
+        if len(s) > 220:
+            return False, f"sentence {i+1} too long"
         if cy.search(s) or _has_emoji_or_flag(s):
-            return False, "experiences: Cyrillic or emoji not allowed"
-    if cy.search(what_special) or _has_emoji_or_flag(what_special):
-        return False, "what_makes_it_special: Cyrillic or emoji not allowed"
-    if cy.search(hook) or _has_emoji_or_flag(hook):
-        return False, "hook: Cyrillic or emoji not allowed"
-    if cy.search(personal_note) or _has_emoji_or_flag(personal_note):
-        return False, "personal_note: Cyrillic or emoji not allowed"
-    if cy.search(closing) or _has_emoji_or_flag(closing):
-        return False, "closing: Cyrillic or emoji not allowed"
+            return False, f"sentence {i+1}: Cyrillic or emoji not allowed"
     if cy.search(city) or cy.search(country) or _has_emoji_or_flag(city) or _has_emoji_or_flag(country):
         return False, "city/country must be Latin letters only, no emoji"
 
@@ -3522,15 +3499,7 @@ def validate_interesting_cities(
         return False, "city already used (banned list)"
 
     sig = build_interesting_cities_signature(
-        {
-            "city_name": city,
-            "country": country,
-            "hook": hook,
-            "what_makes_it_special": what_special,
-            "experiences": experiences,
-            "personal_note": personal_note,
-            "closing": closing,
-        }
+        {"city_name": city, "country": country, "sentences": sents}
     )
     recent_norm = {_normalize_text(x) for x in recent_signatures if x}
     if sig in recent_norm:
@@ -3539,11 +3508,7 @@ def validate_interesting_cities(
     data["city_name"] = city
     data["country"] = country
     data["photo_query"] = pq
-    data["hook"] = hook
-    data["what_makes_it_special"] = what_special
-    data["experiences"] = experiences
-    data["personal_note"] = personal_note
-    data["closing"] = closing
+    data["sentences"] = sents
     return True, "ok"
 
 
@@ -3558,6 +3523,8 @@ async def generate_interesting_cities_content(
     hist = list(history)
     for attempt in range(1, max_attempts + 1):
         data = await generate_content("interesting_cities", hist, extra)
+        if isinstance(data, list):
+            data = data[0] if data else {}
         ok, reason = validate_interesting_cities(data, hist, recent_signatures, extra)
         if ok:
             if attempt > 1:
@@ -4178,22 +4145,11 @@ def build_photo_relax_caption(data: dict) -> str:
 def build_interesting_cities_caption(data: dict) -> str:
     city = str(data.get("city_name", "")).strip()
     country = str(data.get("country", "")).strip()
-    hook = str(data.get("hook", "")).strip()
-    what_special = str(data.get("what_makes_it_special", "")).strip()
-    experiences = data.get("experiences") or []
-    exp = [str(x).strip() for x in experiences if str(x).strip()]
-    note = str(data.get("personal_note", "")).strip()
-    closing = str(data.get("closing", "")).strip()
-    blocks: list[str] = [f"{city}, {country}", hook]
-    if what_special:
-        blocks.append(what_special)
-    if exp:
-        blocks.append("\n\n".join(exp))
-    if note:
-        blocks.append(note)
-    if closing:
-        blocks.append(closing)
-    return "\n\n".join(blocks)
+    sents = _normalize_interesting_cities_sentences(data)
+    if not sents:
+        return f"{city}, {country}".strip(", ")
+    body = "\n\n".join(sents)
+    return f"{city}, {country}\n\n{body}"
 
 
 async def send_photo_to_telegram(
@@ -4762,7 +4718,7 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
   prepositions_quiz      (16:00)
 
 Сб 16:00 Europe/Kyiv — чисте фото PNG + текст у caption:
-  interesting_cities   — фото + живий текст (англ.): гачок, що особливе, 2–4 досвіди, особиста нотка, завершення (без нумерованих списків)
+  interesting_cities   — фото + 5–7 речень англ. (живий тон, як у попередній специфікації)
 
 Нд 16:00 Europe/Kyiv — відео 9:16 (сток Pexels/Pixabay → Gemini A2 текст → ElevenLabs / Google TTS → FFmpeg + бренд 2–3 с), без підпису:
   travel_video
