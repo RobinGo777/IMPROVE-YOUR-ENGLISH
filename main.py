@@ -60,6 +60,24 @@ ELEVENLABS_API_KEY   = os.environ.get("ELEVENLABS_API_KEY", "").strip()
 ELEVENLABS_VOICE_ID  = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
 # Google Cloud TTS: шлях до JSON service account (у контейнері — secret mount)
 GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+# travel_video: абсолютний шлях, якщо бінарник не в PATH (Railway/Nixpacks часто без ffmpeg — тоді Dockerfile або apt)
+def _resolve_media_bin(env_name: str, default_name: str) -> str:
+    p = os.environ.get(env_name, "").strip()
+    if p:
+        return p
+    w = shutil.which(default_name)
+    return w if w else default_name
+
+
+FFMPEG_BIN = _resolve_media_bin("FFMPEG_PATH", "ffmpeg")
+FFPROBE_BIN = _resolve_media_bin("FFPROBE_PATH", "ffprobe")
+
+
+def _media_executable_ok(cmd: str) -> bool:
+    if os.path.isfile(cmd) and os.access(cmd, os.X_OK):
+        return True
+    return shutil.which(cmd) is not None
+
 
 # ──────────────────────────────────────────────
 # МОДЕЛІ
@@ -1708,7 +1726,7 @@ def ffprobe_duration_seconds(path: str) -> float:
     try:
         r = subprocess.run(
             [
-                "ffprobe",
+                FFPROBE_BIN,
                 "-v",
                 "error",
                 "-show_entries",
@@ -1736,6 +1754,12 @@ def _run_ffmpeg(args: list[str]) -> bool:
             log.error(f"❌ ffmpeg failed: {r.stderr[:800]}")
             return False
         return True
+    except FileNotFoundError:
+        log.error(
+            f"❌ ffmpeg не знайдено ({args[0]!r}). "
+            "У контейнері має бути пакет ffmpeg (див. Dockerfile) або змінна FFMPEG_PATH."
+        )
+        return False
     except Exception as e:
         log.error(f"❌ ffmpeg exception: {e}")
         return False
@@ -1881,7 +1905,7 @@ async def fetch_pixabay_music_url() -> str | None:
 def normalize_clip_to_vertical_9_16(src: str, dst: str, max_sec: float) -> bool:
     vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     args = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-threads",
         "2",
@@ -1915,7 +1939,7 @@ def concat_videos_ffmpeg(paths: list[str], out_path: str, max_total_sec: float) 
             return True
         return _run_ffmpeg(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-i",
                 paths[0],
@@ -1934,7 +1958,7 @@ def concat_videos_ffmpeg(paths: list[str], out_path: str, max_total_sec: float) 
         tmp_concat = out_path + ".concat.mp4"
         ok = _run_ffmpeg(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-f",
                 "concat",
@@ -1953,7 +1977,7 @@ def concat_videos_ffmpeg(paths: list[str], out_path: str, max_total_sec: float) 
         if d > max_total_sec:
             ok2 = _run_ffmpeg(
                 [
-                    "ffmpeg",
+                    FFMPEG_BIN,
                     "-y",
                     "-i",
                     tmp_concat,
@@ -2041,7 +2065,7 @@ def mix_voice_and_music(voice_mp3: str, music_path: str | None, out_path: str) -
         return True
     # Тиха музика; amix duration=first = довжина голосу
     args = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-i",
         voice_mp3,
@@ -2069,7 +2093,7 @@ def mux_video_audio_pad(video_path: str, audio_path: str, out_path: str) -> bool
     if pad <= 0.01:
         return _run_ffmpeg(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-i",
                 video_path,
@@ -2091,7 +2115,7 @@ def mux_video_audio_pad(video_path: str, audio_path: str, out_path: str) -> bool
         )
     return _run_ffmpeg(
         [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-i",
             video_path,
@@ -2118,7 +2142,7 @@ def final_encode_for_telegram(src_path: str, dst_path: str) -> bool:
     """Агресивний бітрейт, H.264 + AAC, 9:16."""
     return _run_ffmpeg(
         [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-threads",
             "2",
@@ -2152,7 +2176,7 @@ def concat_two_videos(v1: str, v2: str, out_path: str) -> bool:
         lst.close()
         ok = _run_ffmpeg(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-f",
                 "concat",
@@ -2170,7 +2194,7 @@ def concat_two_videos(v1: str, v2: str, out_path: str) -> bool:
         log.warning("⚠️ concat copy failed — re-encoding")
         return _run_ffmpeg(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-f",
                 "concat",
@@ -2279,7 +2303,7 @@ async def render_branding_png_bytes() -> bytes:
 async def branding_clip_to_mp4(png_path: str, out_mp4: str, duration_sec: float) -> bool:
     """Статичний кадр → коротке відео з тихим AAC (для concat з основним роликом)."""
     args = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-threads",
         "2",
@@ -4858,6 +4882,15 @@ async def main():
     log.info("🎬 travel_video: окремий відео-пайплайн (неділя 16:00)")
     log.info(f"📝 Quiz rubrics: {QUIZ_RUBRICS}")
     log.info("🧪 HTTP: GET / — опис усіх тестових рубрик; GET /test/<rubric> — ручний запуск")
+
+    if not _media_executable_ok(FFMPEG_BIN) or not _media_executable_ok(FFPROBE_BIN):
+        log.warning(
+            f"⚠️ ffmpeg/ffprobe недоступні (ffmpeg={FFMPEG_BIN!r}, ffprobe={FFPROBE_BIN!r}). "
+            "travel_video не зможе обробляти відео. Зберіть образ з Dockerfile (apt install ffmpeg) "
+            "або встановіть ffmpeg у середовищі / задайте FFMPEG_PATH та FFPROBE_PATH."
+        )
+    else:
+        log.info(f"✅ ffmpeg: {FFMPEG_BIN!r}, ffprobe: {FFPROBE_BIN!r}")
 
     redis_client = UpstashRedis()
     try:
