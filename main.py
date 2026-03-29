@@ -117,8 +117,8 @@ TRAVEL_VIDEO_BRAND_SEC = 2.5
 TRAVEL_VIDEO_PIPELINE_ATTEMPTS = 3
 TRAVEL_VIDEO_NARRATION_WORDS_MAX = 160
 
-INTERESTING_CITIES_SENTENCES_MIN = 5
-INTERESTING_CITIES_SENTENCES_MAX = 7
+INTERESTING_CITIES_SENTENCES_MIN = 3
+INTERESTING_CITIES_SENTENCES_MAX = 5
 
 PLACEHOLDER_RUBRICS = frozenset()
 
@@ -2872,9 +2872,9 @@ Your style:
 — as if you're texting a friend, not selling a tour
 — no dry facts, years, or dates; no encyclopaedic tone
 
-Task: write ONE short post about ONE place — a city, a small town, or a capital. The whole story must fit in **{INTERESTING_CITIES_SENTENCES_MIN} to {INTERESTING_CITIES_SENTENCES_MAX} sentences** total (count only the sentences in "sentences").
+Task: write ONE short post about ONE place — a city, a small town, or a capital. The whole caption body must be **only {INTERESTING_CITIES_SENTENCES_MIN} to {INTERESTING_CITIES_SENTENCES_MAX} sentences** (the "sentences" array — nothing else).
 
-Suggested flow inside those sentences (still one sentence each): a hook → what feels special → one or two concrete places or moments → a personal reaction → a light ending or question. Keep each sentence fairly short.
+Content focus (no separate "hook" line, no dramatic opener): start straight into what feels real about the place — what makes it special, one or two concrete spots or small moments, maybe a brief personal aside. **Do NOT** add a punchy advertising-style hook at the start. **Do NOT** end with a question to the reader, a "what do you think?", or a tagged-on CTA — the last sentence should simply land (feeling or image), not ask something.
 
 {banned_note}{history_note}
 Return ONLY valid JSON, no markdown, no extra text:
@@ -2883,13 +2883,12 @@ Return ONLY valid JSON, no markdown, no extra text:
   "country": "English name of the country",
   "photo_query": "compact English keywords for stock photo search (place + country + one visual cue; avoid keyword spam)",
   "sentences": [
-    "Exactly {INTERESTING_CITIES_SENTENCES_MIN} to {INTERESTING_CITIES_SENTENCES_MAX} strings; each string is ONE complete sentence in English.",
-    "Second sentence...",
-    "... up to {INTERESTING_CITIES_SENTENCES_MAX} sentences total."
+    "{INTERESTING_CITIES_SENTENCES_MIN} to {INTERESTING_CITIES_SENTENCES_MAX} strings only; each string is ONE complete sentence.",
+    "..."
   ]
 }}
 Rules:
-- The "sentences" array MUST have length {INTERESTING_CITIES_SENTENCES_MIN}, {INTERESTING_CITIES_SENTENCES_MAX}, or any integer in between (e.g. 6 is allowed). Never fewer than {INTERESTING_CITIES_SENTENCES_MIN} or more than {INTERESTING_CITIES_SENTENCES_MAX}.
+- The "sentences" array MUST have length between {INTERESTING_CITIES_SENTENCES_MIN} and {INTERESTING_CITIES_SENTENCES_MAX} inclusive.
 - English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols.
 - Natural spoken English (B1-ish): clear for learners; avoid rare jargon.
 - No numbered list markers in the text (no "1.", "2." at the start of a sentence).
@@ -3256,7 +3255,7 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
     elif rubric == "photo_relax":
         max_tok = 1000
     elif rubric == "interesting_cities":
-        max_tok = 1600
+        max_tok = 1200
     elif rubric == "travel_video_landmark":
         max_tok = 2200
     else:
@@ -4718,7 +4717,7 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
   prepositions_quiz      (16:00)
 
 Сб 16:00 Europe/Kyiv — чисте фото PNG + текст у caption:
-  interesting_cities   — фото + 5–7 речень англ. (живий тон, як у попередній специфікації)
+  interesting_cities   — фото + 3–5 речень англ. (живий тон; без окремого гачка й без фінального питання)
 
 Нд 16:00 Europe/Kyiv — відео 9:16 (сток Pexels/Pixabay → Gemini A2 текст → ElevenLabs / Google TTS → FFmpeg + бренд 2–3 с), без підпису:
   travel_video
