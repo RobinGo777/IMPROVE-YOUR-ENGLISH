@@ -1913,32 +1913,40 @@ Rules:
                 f"\nDo NOT choose any of these city+country pairs again "
                 f"(same idea, even if spelling varies): {banned[-40:]}\n"
             )
-        return f"""You are an English teacher. Create a short, engaging Telegram-style post about ONE interesting city for Ukrainian students learning English.
+        return f"""You are a travel blogger and an English teacher. Write in a MINIMALIST style: short, clear, no filler.
+Your readers are Ukrainian students; the post must help them read simple travel English.
 {banned_note}{history_note}
 Return ONLY valid JSON, no markdown, no extra text:
 {{
   "city_name": "English name of the city",
   "country": "English name of the country",
-  "photo_query": "compact English keywords for stock photo search (city + country + visual cues, no commas overload)",
-  "paragraphs": [
-    "First sentence of the main description.",
-    "Second sentence.",
-    "Third sentence."
+  "photo_query": "compact English keywords for stock photo search (city + country + one visual cue; avoid keyword spam)",
+  "hook": "One short sentence only — the hook (mood, contrast, or what pulls you in).",
+  "famous_for": [
+    "Short fact 1 (food, architecture, history, or mood).",
+    "Short fact 2 (omit this string if one fact is enough — then use an array of length 1 only)."
   ],
-  "highlights": [
-    "Short point about a place or feature.",
-    "Another point.",
-    "Third point."
-  ]
+  "sights": [
+    "Best place or view 1.",
+    "Best place or view 2.",
+    "Best place or view 3."
+  ],
+  "why_visit": "One closing sentence: emotion + benefit (e.g. Perfect for those who want a quiet weekend / cheap food / old streets — pick one angle)."
 }}
+Structure (content must follow this logic in the JSON fields):
+1) Title in the channel will be city + country (use city_name + country).
+2) hook — one sentence only.
+3) famous_for — 1 or 2 strings (each string is one fact; if two facts, use two short strings).
+4) sights — exactly 3 strings; only the strongest places or views.
+5) why_visit — one closing line: why go (feeling + use).
 Rules:
-- English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols.
-- Pick ONE unique or atmospheric city anywhere in the world — not necessarily a capital. Avoid only the most obvious mega-cities unless they are truly special for a clear reason.
-- Vary continents and styles across time: do not repeat generic "beautiful old town" filler; be specific.
-- "paragraphs": between 3 and 5 complete sentences. Together they should cover: what makes the city unique; what feels special or atmospheric; why it is worth visiting.
-- "highlights": between 3 and 5 short lines (places, atmosphere, culture, nature, food, etc.) — each one clear and concrete.
-- CEFR A2–B1: simple, natural vocabulary; friendly, slightly atmospheric tone; not too formal.
-- "photo_query": English keywords that would find a strong travel/cityscape/architecture photo of THAT city (for Unsplash/Pexels/Pixabay). No need to include the word "photo".
+- English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols, no decorative bullets in the text.
+- CEFR A2 ONLY: very simple words and grammar; short sentences; present simple mostly; avoid rare words and long clauses.
+- Minimalism: cut every line until it is still clear; no "as we all know", no tourist brochure clichés without a concrete detail.
+- Pick ONE interesting city anywhere in the world — not always a capital. Vary continents over time. Be specific (one concrete detail beats vague praise).
+- "famous_for" must be an array of 1 or 2 non-empty strings.
+- "sights" must be an array of EXACTLY 3 non-empty strings (locations or very short labels).
+- "photo_query": keywords that would find a strong cityscape/architecture/street photo of THAT city (Unsplash/Pexels/Pixabay).
 - Do not repeat cities from the banned list above."""
 
     raise ValueError(f"Unknown rubric: {rubric}")
@@ -2459,9 +2467,13 @@ def _interesting_cities_place_key(city: str, country: str) -> str:
 def build_interesting_cities_signature(data: dict) -> str:
     city = str(data.get("city_name", "")).strip()
     country = str(data.get("country", "")).strip()
-    paras = data.get("paragraphs") or []
-    highs = data.get("highlights") or []
-    body = " ".join(str(p) for p in paras) + " | " + " ".join(str(h) for h in highs)
+    hook = str(data.get("hook", "")).strip()
+    famous = data.get("famous_for") or []
+    sights = data.get("sights") or []
+    why = str(data.get("why_visit", "")).strip()
+    ff = " ".join(str(x).strip() for x in famous if str(x).strip())
+    ss = " ".join(str(x).strip() for x in sights if str(x).strip())
+    body = f"{hook} | {ff} | {ss} | {why}"
     return _normalize_text(f"{city}|{country}|{body}")[:400]
 
 
@@ -2481,25 +2493,41 @@ def validate_interesting_cities(
     if not pq:
         pq = f"{city} {country} city travel landscape architecture"
     data["photo_query"] = pq
-    paras = data.get("paragraphs")
-    highs = data.get("highlights")
-    if not isinstance(paras, list) or not isinstance(highs, list):
-        return False, "paragraphs and highlights must be lists"
-    paras = [str(p).strip() for p in paras if str(p).strip()]
-    highs = [str(h).strip() for h in highs if str(h).strip()]
-    if not (3 <= len(paras) <= 5):
-        return False, "paragraphs must have 3–5 items"
-    if not (3 <= len(highs) <= 5):
-        return False, "highlights must have 3–5 items"
+    hook = str(data.get("hook", "")).strip()
+    famous = data.get("famous_for")
+    sights = data.get("sights")
+    why_visit = str(data.get("why_visit", "")).strip()
+    if not hook:
+        return False, "empty hook"
+    if not why_visit:
+        return False, "empty why_visit"
+    if not isinstance(famous, list) or not isinstance(sights, list):
+        return False, "famous_for and sights must be lists"
+    famous = [str(x).strip() for x in famous if str(x).strip()]
+    sights = [str(x).strip() for x in sights if str(x).strip()]
+    if not (1 <= len(famous) <= 2):
+        return False, "famous_for must have 1–2 items"
+    if len(sights) != 3:
+        return False, "sights must have exactly 3 items"
     cy = re.compile(r"[\u0400-\u04FF]")
-    for block, label in [(paras, "paragraph"), (highs, "highlight")]:
-        for i, s in enumerate(block):
-            if len(s) > 320:
-                return False, f"{label} {i+1} too long"
-            if cy.search(s):
-                return False, "Cyrillic not allowed"
-            if _has_emoji_or_flag(s):
-                return False, "emoji/flags not allowed"
+    if len(hook) > 240:
+        return False, "hook too long"
+    if len(why_visit) > 300:
+        return False, "why_visit too long"
+    for i, s in enumerate(famous):
+        if len(s) > 220:
+            return False, f"famous_for {i+1} too long"
+        if cy.search(s) or _has_emoji_or_flag(s):
+            return False, "famous_for: Cyrillic or emoji not allowed"
+    for i, s in enumerate(sights):
+        if len(s) > 160:
+            return False, f"sight {i+1} too long"
+        if cy.search(s) or _has_emoji_or_flag(s):
+            return False, "sights: Cyrillic or emoji not allowed"
+    if cy.search(hook) or _has_emoji_or_flag(hook):
+        return False, "hook: Cyrillic or emoji not allowed"
+    if cy.search(why_visit) or _has_emoji_or_flag(why_visit):
+        return False, "why_visit: Cyrillic or emoji not allowed"
     if cy.search(city) or cy.search(country) or _has_emoji_or_flag(city) or _has_emoji_or_flag(country):
         return False, "city/country must be Latin letters only, no emoji"
 
@@ -2509,7 +2537,14 @@ def validate_interesting_cities(
         return False, "city already used (banned list)"
 
     sig = build_interesting_cities_signature(
-        {"city_name": city, "country": country, "paragraphs": paras, "highlights": highs}
+        {
+            "city_name": city,
+            "country": country,
+            "hook": hook,
+            "famous_for": famous,
+            "sights": sights,
+            "why_visit": why_visit,
+        }
     )
     recent_norm = {_normalize_text(x) for x in recent_signatures if x}
     if sig in recent_norm:
@@ -2518,8 +2553,10 @@ def validate_interesting_cities(
     data["city_name"] = city
     data["country"] = country
     data["photo_query"] = pq
-    data["paragraphs"] = paras
-    data["highlights"] = highs
+    data["hook"] = hook
+    data["famous_for"] = famous
+    data["sights"] = sights
+    data["why_visit"] = why_visit
     return True, "ok"
 
 
@@ -2553,13 +2590,17 @@ async def generate_interesting_cities_content(
 def build_interesting_cities(data: dict, photo_b64: str) -> str:
     city = _safe_html(str(data.get("city_name", "")))
     country = _safe_html(str(data.get("country", "")))
-    paras = data.get("paragraphs") or []
-    highs = data.get("highlights") or []
-    paras_html = "\n".join(
-        f'<p class="ic-para">{_safe_html(str(p))}</p>' for p in paras[:5]
+    hook = _safe_html(str(data.get("hook", "")).strip())
+    famous = data.get("famous_for") or []
+    sights = data.get("sights") or []
+    why_visit = _safe_html(str(data.get("why_visit", "")).strip())
+    famous_html = "\n".join(
+        f'<p class="ic-para ic-fact">{_safe_html(str(p).strip())}</p>'
+        for p in famous[:2]
+        if str(p).strip()
     )
     li_html = "\n".join(
-        f'<li class="ic-li">{_safe_html(str(h))}</li>' for h in highs[:5]
+        f'<li class="ic-li">{_safe_html(str(h).strip())}</li>' for h in sights[:3]
     )
 
     return f"""<!DOCTYPE html>
@@ -2605,12 +2646,30 @@ def build_interesting_cities(data: dict, photo_b64: str) -> str:
     color: #1e1a17;
     margin-bottom: 4px;
   }}
+  .ic-hook {{
+    font-size: 23px;
+    font-weight: 500;
+    line-height: 1.38;
+    color: #2a2520;
+    margin: 0 0 10px 0;
+  }}
   .ic-para {{
     font-size: 22px;
     font-weight: 400;
     line-height: 1.42;
     color: #2a2520;
     margin: 0 0 6px 0;
+  }}
+  .ic-fact {{
+    font-size: 21px;
+    color: #3d3630;
+  }}
+  .ic-why {{
+    font-size: 22px;
+    font-weight: 500;
+    line-height: 1.4;
+    color: #1e1a17;
+    margin-top: 8px;
   }}
   .ic-ul {{
     margin: 8px 0 0 0;
@@ -2630,10 +2689,12 @@ def build_interesting_cities(data: dict, photo_b64: str) -> str:
   <div class="ic-photo" role="img" aria-label="City photo"></div>
   <div class="ic-body">
     <div class="ic-title">{city}, {country}</div>
-{paras_html}
+    <p class="ic-hook">{hook}</p>
+{famous_html}
     <ul class="ic-ul">
 {li_html}
     </ul>
+    <p class="ic-why">{why_visit}</p>
   </div>
 </body>
 </html>"""
@@ -3208,16 +3269,59 @@ async def render_card(html: str) -> bytes:
 
 
 # ──────────────────────────────────────────────
-# TELEGRAM — ПУБЛІКАЦІЯ
+# TELEGRAM — ПУБЛІКАЦІ
 # ──────────────────────────────────────────────
-async def send_photo_to_telegram(png_bytes: bytes, rubric: str) -> bool:
+TELEGRAM_CAPTION_MAX = 1024
+
+
+def clip_telegram_caption(text: str) -> tuple[str, bool]:
+    text = (text or "").strip()
+    if len(text) <= TELEGRAM_CAPTION_MAX:
+        return text, False
+    return text[: TELEGRAM_CAPTION_MAX - 1].rstrip() + "…", True
+
+
+def build_photo_relax_caption(data: dict) -> str:
+    raw = data.get("sentences")
+    if not isinstance(raw, list):
+        return ""
+    lines = [str(x).strip() for x in raw[:4] if str(x).strip()]
+    return "\n\n".join(lines)
+
+
+def build_interesting_cities_caption(data: dict) -> str:
+    city = str(data.get("city_name", "")).strip()
+    country = str(data.get("country", "")).strip()
+    hook = str(data.get("hook", "")).strip()
+    famous = data.get("famous_for") or []
+    sights = data.get("sights") or []
+    why = str(data.get("why_visit", "")).strip()
+    ff = [str(x).strip() for x in famous if str(x).strip()][:2]
+    ss = [str(x).strip() for x in sights if str(x).strip()][:3]
+    blocks: list[str] = [f"{city}, {country}", hook]
+    if ff:
+        blocks.append("\n".join(ff))
+    if len(ss) == 3:
+        blocks.append("\n".join(f"{i}. {s}" for i, s in enumerate(ss, 1)))
+    if why:
+        blocks.append(why)
+    return "\n\n".join(blocks)
+
+
+async def send_photo_to_telegram(
+    png_bytes: bytes, rubric: str, caption: str | None = None
+) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    cap = (caption or "").strip()
+    form_data: dict = {"chat_id": TELEGRAM_CHAT_ID}
+    if cap:
+        form_data["caption"] = cap
     for attempt in range(1, 4):
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     url,
-                    data={"chat_id": TELEGRAM_CHAT_ID},
+                    data=form_data,
                     files={"photo": (f"{rubric}.png", png_bytes, "image/png")},
                 )
                 log.info(f"📤 Telegram sendPhoto attempt {attempt}: status={resp.status_code}")
@@ -3529,9 +3633,25 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
         log.info(f"🎨 Rendering PNG for [{rubric}]...")
         png_bytes = await render_card(html)
 
-        # 6. Публікуємо
+        # 6. Публікуємо (caption під медіа — photo_relax та interesting_cities)
         log.info(f"📤 Sending to Telegram [{rubric}]...")
-        success = await send_photo_to_telegram(png_bytes, rubric)
+        caption_raw = None
+        if rubric == "photo_relax":
+            caption_raw = build_photo_relax_caption(data)
+        elif rubric == "interesting_cities":
+            caption_raw = build_interesting_cities_caption(data)
+        caption_out, clipped = (
+            clip_telegram_caption(caption_raw) if caption_raw else ("", False)
+        )
+        if clipped:
+            log.warning(
+                f"⚠️ Telegram caption clipped to {TELEGRAM_CAPTION_MAX} chars for [{rubric}]"
+            )
+        if caption_out:
+            log.info(f"📝 Telegram caption length={len(caption_out)} for [{rubric}]")
+        success = await send_photo_to_telegram(
+            png_bytes, rubric, caption=caption_out or None
+        )
 
         # 7. Зберігаємо в історію
         if success:
@@ -3748,7 +3868,7 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
   prepositions_quiz      (16:00)
 
 Сб 16:00 Europe/Kyiv — PNG (картка як photo_relax):
-  interesting_cities   — місто + країна, фото + текст (en) + bullet-підсумки
+  interesting_cities   — місто + країна; hook → 1–2 факти → 3 локації → чому їхати (en A2, мінімалізм)
 
 Нд 16:00 — заплановано доробити (зараз заглушка, пост не генерується):
   travel_video
