@@ -11,6 +11,7 @@ import random
 import re
 import time
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from io import BytesIO
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -68,20 +69,77 @@ GEMINI_MODELS = [
 ]
 
 # ──────────────────────────────────────────────
-# РОЗКЛАД
+# РОЗКЛАД (усі тригери — локальний час Europe/Kyiv)
 # ──────────────────────────────────────────────
-SCHEDULE = {
-    9:  "daily_phrase",
-    10: "grammar_quiz",
-    11: "vocabulary_quiz",
-    12: "situation_phrases",
-    13: "confusing_words_quiz",
-    14: "prepositions_quiz",
-    15: "quote_motivation",
+TZ = ZoneInfo("Europe/Kyiv")
+
+# Пн–Пт: 10:00 — «великий» пост; 11:30, 13:00, 14:30, 16:00 — квізи (фіксований порядок щодня)
+QUIZ_SLOTS: list[tuple[tuple[int, int], str]] = [
+    ((11, 30), "grammar_quiz"),
+    ((13, 0), "vocabulary_quiz"),
+    ((14, 30), "confusing_words_quiz"),
+    ((16, 0), "prepositions_quiz"),
+]
+
+# Пн–Пт о 10:00 Europe/Kyiv. weekday: 0=Пн … 4=Пт (datetime.weekday())
+WEEKDAY_10_00: dict[int, str] = {
+    0: "quote_motivation",   # Пн
+    1: "vocabulary_15",      # Вт 10:00 — 15 слів + IPA (кремова картка)
+    2: "daily_phrase",       # Ср 10:00 — фраза дня + приклад (en) + переклад (ua); build_daily_phrase + Unsplash
+    3: "situation_phrases",  # Чт 10:00 — 5 фраз (en/ua) для життєвої ситуації; ротація SITUATION_CATEGORIES або тема свята; build_situation_phrases + Unsplash
+    4: "photo_relax",        # Пт 10:00 — природа (фото) + 4 речення en A2–B1 під знімком; Unsplash→Pexels→Pixabay
 }
 
+# Сб / Нд о 16:00 — окремі рубрики (контент TBD)
+WEEKEND_16_00: dict[int, str] = {
+    5: "interesting_cities",
+    6: "travel_video",
+}
+
+PLACEHOLDER_RUBRICS = frozenset({"travel_video"})
+
+
+def get_rubric_for_datetime(now: datetime) -> str | None:
+    """Повертає рубрику для моменту `now` (має бути aware у TZ) або None."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=TZ)
+    else:
+        now = now.astimezone(TZ)
+
+    wd = now.weekday()
+    h, m = now.hour, now.minute
+
+    if wd <= 4:
+        if (h, m) == (10, 0):
+            return WEEKDAY_10_00[wd]
+        for (hh, mm), rubric in QUIZ_SLOTS:
+            if (h, m) == (hh, mm):
+                return rubric
+        return None
+
+    if wd in WEEKEND_16_00 and (h, m) == (16, 0):
+        return WEEKEND_16_00[wd]
+    return None
+
+
 QUIZ_RUBRICS = {"grammar_quiz", "vocabulary_quiz", "confusing_words_quiz", "prepositions_quiz"}
-IMAGE_RUBRICS = {"daily_phrase", "situation_phrases", "quote_motivation"}
+IMAGE_RUBRICS = {
+    "daily_phrase",
+    "situation_phrases",
+    "quote_motivation",
+    "vocabulary_15",
+    "photo_relax",
+    "interesting_cities",
+}
+
+# photo_relax: ротація тем пошуку фото + контекст для Gemini (без дощу/вечора як орієнтирів)
+PHOTO_RELAX_THEMES: list[dict] = [
+    {"id": "sea", "label": "the sea or coastline (water, horizon, open or calm sea)", "photo_query": "ocean sea coast nature landscape"},
+    {"id": "forest", "label": "a forest or woodland (trees, path, green light)", "photo_query": "forest trees nature path sunlight"},
+    {"id": "mountains", "label": "mountains or hills (peaks, ridges, distance)", "photo_query": "mountain peaks landscape nature alpine"},
+    {"id": "lake", "label": "a lake (still water, shore, reflections)", "photo_query": "lake mountains reflection nature landscape"},
+    {"id": "waterfall", "label": "a waterfall (water, rocks, mist)", "photo_query": "waterfall nature forest rocks"},
+]
 
 # ──────────────────────────────────────────────
 # SITUATION PHRASES — 18 КАТЕГОРІЙ (РОТАЦІЯ)
@@ -693,8 +751,19 @@ QUIZ_VALIDATION_MAX_ATTEMPTS = 3
 QUIZ_SIGNATURE_HISTORY_LIMIT = 60
 QUIZ_SIGNATURE_CHECK_WINDOW = 40
 PHOTO_URL_HISTORY_LIMIT = 50
-PHOTO_URL_CHECK_WINDOW = 25
-PHOTO_URL_REFETCH_ATTEMPTS = 2
+PHOTO_URL_CHECK_WINDOW = 35
+PHOTO_URL_REFETCH_ATTEMPTS = 4
+
+# Додаємо до запиту при refetch, щоб Unsplash не повертав той самий «переможець»
+DAILY_PHOTO_REFETCH_TAGS = [
+    "soft light variation",
+    "different angle nature",
+    "alternate framing landscape",
+    "misty atmospheric depth",
+    "golden hour variant",
+    "wide scenic mood",
+    "peaceful morning haze",
+]
 
 
 def get_season(month: int) -> str:
@@ -899,6 +968,71 @@ async def get_quote_photo_query(history_mgr) -> str:
         return fallback
 
 
+async def pick_vocabulary_15_theme(history_mgr: "HistoryManager") -> dict:
+    """
+    Вівторок + дата з HOLIDAYS → святкова лексика.
+    Інакше випадково: тема з DAILY_PHRASE_TOPICS (атлас) або «вільна» категорія від Gemini.
+    Список використаних назв тем — Redis used:vocabulary_15_themes (поповнюється після успішного поста).
+    """
+    today = datetime.now(TZ).date()
+    wd = today.weekday()
+    hol = HOLIDAYS.get((today.month, today.day))
+
+    if wd == 1 and hol is not None:
+        return {
+            "theme_mode": "holiday",
+            "theme_title": f"{hol['name']} — English vocabulary",
+            "theme_scope": (
+                f"{hol['situation_description']} "
+                "Generate vocabulary useful for this occasion (mixed A2–B1)."
+            ),
+        }
+
+    try:
+        used_raw = await history_mgr.r.lrange("used:vocabulary_15_themes", 0, -1)
+        used_set = {str(x) for x in (used_raw or []) if x}
+    except Exception as e:
+        log.error(f"❌ pick_vocabulary_15_theme redis: {e}")
+        used_set = set()
+
+    if random.random() < 0.5:
+        candidates = [t for t in DAILY_PHRASE_TOPICS if t["name"] not in used_set]
+        if not candidates:
+            try:
+                await history_mgr.r.delete("used:vocabulary_15_themes")
+            except Exception:
+                pass
+            candidates = list(DAILY_PHRASE_TOPICS)
+        t = random.choice(candidates)
+        return {
+            "theme_mode": "atlas",
+            "theme_title": t["name"],
+            "theme_scope": t["desc"],
+        }
+
+    return {
+        "theme_mode": "gemini_freeform",
+        "theme_title": "",
+        "theme_scope": (
+            "Invent ONE clear English title for this post (3–12 words), e.g. "
+            "'15 action verbs for everyday life', '15 adjectives to describe people', "
+            "'15 phrasal verbs about travel'. Then list exactly 15 items matching that title."
+        ),
+    }
+
+
+async def pick_photo_relax_theme(history_mgr: "HistoryManager") -> dict:
+    """Ротація тем природи для п’ятниці photo_relax (індекс зсувається після успішного поста)."""
+    idx = await history_mgr.get_photo_relax_theme_index()
+    t = PHOTO_RELAX_THEMES[idx]
+    log.info(f"🌿 photo_relax theme idx={idx} id={t['id']} query='{t['photo_query']}'")
+    return {
+        "visual_theme": t["label"],
+        "photo_query": t["photo_query"],
+        "theme_id": t["id"],
+    }
+
+
 async def get_daily_phrase_topic(history_mgr) -> dict:
     """Вибирає випадкову тему з атласу, уникаючи повторів."""
     try:
@@ -1094,6 +1228,39 @@ class HistoryManager:
         except Exception as e:
             log.error(f"❌ Redis advance_quote_theme_index error: {e}")
 
+    async def get_photo_relax_theme_index(self) -> int:
+        try:
+            val = await self.r.get("photo_relax:theme_rotation_index")
+            idx = int(val) if val is not None else 0
+            return idx % len(PHOTO_RELAX_THEMES)
+        except Exception as e:
+            log.error(f"❌ Redis get_photo_relax_theme_index error: {e} — using index 0")
+            return 0
+
+    async def advance_photo_relax_theme_index(self):
+        try:
+            current = await self.get_photo_relax_theme_index()
+            next_idx = (current + 1) % len(PHOTO_RELAX_THEMES)
+            await self.r.set("photo_relax:theme_rotation_index", str(next_idx))
+            log.info(f"🌿 photo_relax theme index advanced: {current} → {next_idx}")
+        except Exception as e:
+            log.error(f"❌ Redis advance_photo_relax_theme_index error: {e}")
+
+    async def get_interesting_cities_banned(self) -> list[str]:
+        try:
+            items = await self.r.lrange("used:interesting_cities_places", 0, 99)
+            return [str(x) for x in (items or []) if x]
+        except Exception as e:
+            log.error(f"❌ Redis get_interesting_cities_banned error: {e}")
+            return []
+
+    async def add_interesting_city_place(self, place_key: str):
+        try:
+            await self.r.lpush("used:interesting_cities_places", place_key)
+            await self.r.ltrim("used:interesting_cities_places", 0, 199)
+        except Exception as e:
+            log.error(f"❌ Redis add_interesting_city_place error: {e}")
+
     async def get_prepositions_subtype_index(self) -> int:
         try:
             val = await self.r.get("prepositions:subtype_rotation_index")
@@ -1257,12 +1424,12 @@ class HistoryManager:
 # ──────────────────────────────────────────────
 # ФОТО API
 # ──────────────────────────────────────────────
-async def fetch_photo_unsplash(query: str, use_topics: bool = True) -> str | None:
+async def fetch_photo_unsplash(query: str, use_topics: bool = True, pick_random: bool = False) -> str | None:
     if not UNSPLASH_ACCESS_KEY:
         log.warning("⚠️ UNSPLASH_ACCESS_KEY not set")
         return None
     try:
-        # Отримуємо 5 фото і вибираємо найкраще за лайками
+        # pick_random: різні кадри з одного пошуку (анти-повтор); інакше — топ за лайками
         url = "https://api.unsplash.com/search/photos"
         params = {
             "query": query,
@@ -1275,17 +1442,20 @@ async def fetch_photo_unsplash(query: str, use_topics: bool = True) -> str | Non
         headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url, params=params, headers=headers)
-            log.info(f"📷 Unsplash response: status={resp.status_code} query='{query}'")
+            log.info(f"📷 Unsplash response: status={resp.status_code} query='{query}' pick_random={pick_random}")
             if resp.status_code == 200:
                 data = resp.json()
                 photos = data.get("results", [])
                 if not photos:
                     log.warning(f"⚠️ Unsplash: no results for query '{query}'")
                     return None
-                # Вибираємо фото з найбільшою кількістю лайків з перших 5
-                best = max(photos[:5], key=lambda p: p.get("likes", 0))
+                pool = photos[:10] if pick_random else photos[:5]
+                if pick_random:
+                    best = random.choice(pool)
+                else:
+                    best = max(pool, key=lambda p: p.get("likes", 0))
                 photo_url = best["urls"]["regular"]
-                log.info(f"✅ Unsplash best photo: likes={best.get('likes',0)} url={photo_url[:60]}")
+                log.info(f"✅ Unsplash photo: likes={best.get('likes',0)} url={photo_url[:60]}")
                 return photo_url
             else:
                 log.warning(f"⚠️ Unsplash failed: {resp.status_code} — {resp.text[:200]}")
@@ -1295,7 +1465,7 @@ async def fetch_photo_unsplash(query: str, use_topics: bool = True) -> str | Non
         return None
 
 
-async def fetch_photo_pexels(query: str) -> str | None:
+async def fetch_photo_pexels(query: str, pick_random: bool = False) -> str | None:
     if not PEXELS_API_KEY:
         log.warning("⚠️ PEXELS_API_KEY not set")
         return None
@@ -1315,7 +1485,8 @@ async def fetch_photo_pexels(query: str) -> str | None:
                 data = resp.json()
                 photos = data.get("photos", [])
                 if photos:
-                    photo = random.choice(photos[:5])
+                    pool = photos[:10] if pick_random else photos[:5]
+                    photo = random.choice(pool)
                     photo_url = photo["src"]["large"]
                     log.info(f"✅ Pexels photo found: {photo_url[:80]}")
                     return photo_url
@@ -1330,7 +1501,7 @@ async def fetch_photo_pexels(query: str) -> str | None:
         return None
 
 
-async def fetch_photo_pixabay(query: str) -> str | None:
+async def fetch_photo_pixabay(query: str, pick_random: bool = False) -> str | None:
     if not PIXABAY_API_KEY:
         log.warning("⚠️ PIXABAY_API_KEY not set")
         return None
@@ -1352,7 +1523,8 @@ async def fetch_photo_pixabay(query: str) -> str | None:
                 data = resp.json()
                 hits = data.get("hits", [])
                 if hits:
-                    photo = random.choice(hits[:5])
+                    pool = hits[:10] if pick_random else hits[:5]
+                    photo = random.choice(pool)
                     photo_url = photo["largeImageURL"]
                     log.info(f"✅ Pixabay photo found: {photo_url[:80]}")
                     return photo_url
@@ -1367,13 +1539,13 @@ async def fetch_photo_pixabay(query: str) -> str | None:
         return None
 
 
-async def fetch_photo(query: str, use_topics: bool = True) -> str | None:
-    """Пробує Unsplash → Pexels → Pixabay. Повертає URL або None."""
-    log.info(f"🔍 Fetching photo for query: '{query}' use_topics={use_topics}")
+async def fetch_photo(query: str, use_topics: bool = True, pick_random: bool = False) -> str | None:
+    """Пробує Unsplash → Pexels → Pixabay. pick_random — варіативність з топу результатів (анти-повтор)."""
+    log.info(f"🔍 Fetching photo for query: '{query}' use_topics={use_topics} pick_random={pick_random}")
 
     # Спроба 1: Unsplash
     for attempt in range(1, 4):
-        photo_url = await fetch_photo_unsplash(query, use_topics=use_topics)
+        photo_url = await fetch_photo_unsplash(query, use_topics=use_topics, pick_random=pick_random)
         if photo_url:
             return photo_url
         log.warning(f"⚠️ Unsplash attempt {attempt}/3 failed")
@@ -1382,7 +1554,7 @@ async def fetch_photo(query: str, use_topics: bool = True) -> str | None:
 
     # Спроба 2: Pexels
     for attempt in range(1, 4):
-        photo_url = await fetch_photo_pexels(query)
+        photo_url = await fetch_photo_pexels(query, pick_random=pick_random)
         if photo_url:
             return photo_url
         log.warning(f"⚠️ Pexels attempt {attempt}/3 failed")
@@ -1391,7 +1563,7 @@ async def fetch_photo(query: str, use_topics: bool = True) -> str | None:
 
     # Спроба 3: Pixabay
     for attempt in range(1, 4):
-        photo_url = await fetch_photo_pixabay(query)
+        photo_url = await fetch_photo_pixabay(query, pick_random=pick_random)
         if photo_url:
             return photo_url
         log.warning(f"⚠️ Pixabay attempt {attempt}/3 failed")
@@ -1453,14 +1625,12 @@ Return ONLY valid JSON, no markdown, no extra text:
 {{
   "phrase_en": "the English phrase related to the topic (minimum 5 words, max 80 characters)",
   "example_en": "one natural example sentence using the phrase in context (max 140 characters)",
-  "example_ua": "Ukrainian translation of the example sentence (max 140 characters)",
-  "photo_query": "3-5 keywords for stock photo: scene + mood + style (cinematic soft light)"
+  "example_ua": "Ukrainian translation of the example sentence (max 140 characters)"
 }}
 Rules:
 - Phrase must relate to the given topic
 - Minimum 5 words — avoid very short phrases like "See you" or "Thank you"
 - Simple A2 vocabulary, natural everyday conversation
-- photo_query: visual scene related to the topic, add: cinematic dramatic soft light
 {LANGUAGE_CENSOR}"""
 
     if rubric == "situation_phrases":
@@ -1476,14 +1646,11 @@ Return ONLY valid JSON, no markdown, no extra text:
     {{"en": "english phrase (max 70 chars)", "ua": "ukrainian translation (max 80 chars)"}},
     {{"en": "english phrase (max 70 chars)", "ua": "ukrainian translation (max 80 chars)"}},
     {{"en": "english phrase (max 70 chars)", "ua": "ukrainian translation (max 80 chars)"}}
-  ],
-  "photo_query": "3-5 keywords for stock photo: scene + mood + style (minimal aesthetic cinematic soft light)"
+  ]
 }}
 Rules:
 - Practical A2 level phrases for the situation
 - Each phrase must be different and useful
-- photo_query: visual scene related to the situation, add: minimal aesthetic cinematic soft light
-- photo_query examples: "airport runway night dramatic cinematic", "restaurant evening bokeh soft light aesthetic"
 {LANGUAGE_CENSOR}"""
 
     if rubric == "quote_motivation":
@@ -1500,8 +1667,7 @@ Selected theme for this post (mandatory):
 Return ONLY valid JSON, no markdown, no extra text:
 {{
   "quote_en": "the quote in English (minimum 6 words, maximum 12 words, simple A2 vocabulary)",
-  "quote_ua": "Ukrainian translation (natural, not word-for-word)",
-  "photo_query": "3-6 keywords for green nature photo: forest, moss, valley, mountain lake, fog, rain atmosphere; only nature, no people, no city; style: moody cinematic"
+  "quote_ua": "Ukrainian translation (natural, not word-for-word)"
 }}
 Rules:
 - Minimum 6 words — NEVER generate quotes like 'Just do it', 'Dream big', 'Stay strong' (too short)
@@ -1518,9 +1684,6 @@ Rules:
 - Prefer practical, grounded ideas over generic slogans
 - Avoid cliches, toxic positivity, and vague lines without concrete meaning
 - Include ONLY one quote (not a list), and keep it original in wording
-- photo_query: prioritize green nature mood (forest, moss, valley, mountain lake, fog, rain, deep greenery)
-- photo_query: ONLY nature landscapes, NO people, NO urban/city elements
-- Good photo_query examples: "misty green forest cinematic", "mossy forest path fog moody", "emerald mountain lake overcast"
 {LANGUAGE_CENSOR}"""
 
     if rubric == "grammar_quiz":
@@ -1676,6 +1839,108 @@ Rules:
 - Explanation in Ukrainian
 {LANGUAGE_CENSOR}"""
 
+    if rubric == "vocabulary_15":
+        mode = extra.get("theme_mode", "atlas")
+        title = str(extra.get("theme_title", "")).strip()
+        scope = str(extra.get("theme_scope", "")).strip()
+        cefr = extra.get("cefr_band", "A2-B1 mixed")
+        title_line = f'Fixed theme title (use EXACTLY this string for "theme_title"): "{title}"\n' if title else ""
+        mode_rules = ""
+        if mode == "gemini_freeform":
+            mode_rules = (
+                "You MUST invent theme_title yourself (English, 3–12 words) and build 15 words that match it.\n"
+            )
+        else:
+            mode_rules = (
+                "theme_title in JSON must match the fixed title above (character-for-character).\n"
+            )
+        return f"""You are an English teacher. Create a vocabulary list post for Ukrainian students.
+{title_line}Theme mode: {mode}
+Theme scope: {scope}
+Target CEFR level: {cefr} — use mixed A2–B1 vocabulary (clear, high-frequency items; short phrases allowed if they are standard chunks).
+{history_note}
+Return ONLY valid JSON, no markdown, no extra text:
+{{
+  "theme_title": "English title for the card (see rules above)",
+  "theme_title_ua": "optional Ukrainian gloss for logs (not shown on the card)",
+  "words": [
+    {{"word": "English word or short chunk", "ipa": "/IPA in slashes using International Phonetic Alphabet/", "ua": "natural Ukrainian translation or gloss"}},
+    ... exactly 15 objects total ...
+  ]
+}}
+Rules:
+- "theme_title_ua": optional; card heading shows only "theme_title" in English
+- Exactly 15 items in "words"
+- Each "ipa" MUST be IPA inside slashes, e.g. /ˈwɜːrd/ — American or British is OK but be consistent within the list
+- Single words preferred; two-word items only if idiomatic (e.g. phrasal verbs)
+- Ukrainian must sound natural (not literal calques); follow Ukrainian language quality rules below
+- Do not repeat words from the "avoid" list in spirit: vary lemmas and senses
+{mode_rules}
+{LANGUAGE_CENSOR}"""
+
+    if rubric == "photo_relax":
+        visual = str(extra.get("visual_theme", "nature landscape")).strip()
+        tid = str(extra.get("theme_id", "")).strip()
+        return f"""You are an English teacher writing a short calm post for Ukrainian students learning English.
+The Telegram image will show ONLY nature / landscape photography matching this visual focus: {visual}
+(theme id for consistency: {tid})
+{history_note}
+Return ONLY valid JSON, no markdown, no extra text:
+{{
+  "sentences": [
+    "First sentence in English.",
+    "Second sentence in English.",
+    "Third sentence in English.",
+    "Fourth sentence in English."
+  ]
+}}
+Rules:
+- Output MUST be English only (no Ukrainian, no Russian).
+- Exactly 4 separate strings in "sentences" (4 sentences total).
+- CEFR A2–B1: simple, natural vocabulary; short or medium sentences; avoid rare words and complex grammar.
+- Tone: calm, soft, relaxing; you may also use a light neutral / descriptive tone sometimes.
+- Content should fit the visual theme above (sea, forest, mountains, lake, or waterfall — as described). Do NOT centre the text on rain, evening, night, cities, streets, or people.
+- You may use "you" sometimes, or write without addressing the reader — both are fine.
+- Do not start with the same opening pattern as in the recent history hints above.
+- No hashtags, no emojis unless absolutely necessary (prefer none).
+- No lists inside a sentence; each array item is one complete sentence."""
+
+    if rubric == "interesting_cities":
+        banned = extra.get("banned_cities") or []
+        banned_note = ""
+        if banned:
+            banned_note = (
+                f"\nDo NOT choose any of these city+country pairs again "
+                f"(same idea, even if spelling varies): {banned[-40:]}\n"
+            )
+        return f"""You are an English teacher. Create a short, engaging Telegram-style post about ONE interesting city for Ukrainian students learning English.
+{banned_note}{history_note}
+Return ONLY valid JSON, no markdown, no extra text:
+{{
+  "city_name": "English name of the city",
+  "country": "English name of the country",
+  "photo_query": "compact English keywords for stock photo search (city + country + visual cues, no commas overload)",
+  "paragraphs": [
+    "First sentence of the main description.",
+    "Second sentence.",
+    "Third sentence."
+  ],
+  "highlights": [
+    "Short point about a place or feature.",
+    "Another point.",
+    "Third point."
+  ]
+}}
+Rules:
+- English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols.
+- Pick ONE unique or atmospheric city anywhere in the world — not necessarily a capital. Avoid only the most obvious mega-cities unless they are truly special for a clear reason.
+- Vary continents and styles across time: do not repeat generic "beautiful old town" filler; be specific.
+- "paragraphs": between 3 and 5 complete sentences. Together they should cover: what makes the city unique; what feels special or atmospheric; why it is worth visiting.
+- "highlights": between 3 and 5 short lines (places, atmosphere, culture, nature, food, etc.) — each one clear and concrete.
+- CEFR A2–B1: simple, natural vocabulary; friendly, slightly atmospheric tone; not too formal.
+- "photo_query": English keywords that would find a strong travel/cityscape/architecture photo of THAT city (for Unsplash/Pexels/Pixabay). No need to include the word "photo".
+- Do not repeat cities from the banned list above."""
+
     raise ValueError(f"Unknown rubric: {rubric}")
 
 # ──────────────────────────────────────────────
@@ -1744,9 +2009,17 @@ def _safe_html(text: str) -> str:
     )
 
 
+def _ipa_square_brackets(ipa: str) -> str:
+    """IPA для відображення у квадратних дужках як у EnglishCardsGenerator."""
+    s = str(ipa).strip()
+    if len(s) >= 2 and s.startswith("/") and s.endswith("/"):
+        s = s[1:-1].strip()
+    return s
+
+
 def get_cefr_band_for_today() -> str:
     # Пн-Вт A2, Ср-Чт A2+, Пт-Сб B1, Нд mixed review
-    weekday = datetime.now().weekday()  # Mon=0 ... Sun=6
+    weekday = datetime.now(TZ).weekday()  # Mon=0 ... Sun=6
     if weekday in (0, 1):
         return "A2"
     if weekday in (2, 3):
@@ -1820,9 +2093,8 @@ def validate_quiz_payload(rubric: str, data: dict, history: list, recent_signatu
 def validate_quote_motivation(data: dict, used_history: list) -> tuple[bool, str]:
     quote_en = str(data.get("quote_en", "")).strip()
     quote_ua = str(data.get("quote_ua", "")).strip()
-    photo_query = str(data.get("photo_query", "")).strip()
 
-    if not quote_en or not quote_ua or not photo_query:
+    if not quote_en or not quote_ua:
         return False, "missing required fields"
 
     words = [w for w in quote_en.split() if w.strip()]
@@ -1838,11 +2110,6 @@ def validate_quote_motivation(data: dict, used_history: list) -> tuple[bool, str
     if quote_en.lower() == quote_ua.lower():
         return False, "translation equals english text"
 
-    if len(photo_query.split()) < 3:
-        return False, "photo_query too short"
-    if len(photo_query) > 140:
-        return False, "photo_query too long"
-
     recent_norm = [_normalize_quote_text(item) for item in used_history[-25:]]
     if quote_norm and any(quote_norm in h or h in quote_norm for h in recent_norm if h):
         return False, "too similar to recent history"
@@ -1850,12 +2117,108 @@ def validate_quote_motivation(data: dict, used_history: list) -> tuple[bool, str
     return True, "ok"
 
 
-async def call_gemini(api_key: str, prompt: str, model: str = "gemini-2.0-flash-lite") -> dict:
+def build_vocabulary_15_word_signature(words: list) -> str:
+    parts = []
+    for item in words:
+        if not isinstance(item, dict):
+            continue
+        w = _normalize_text(str(item.get("word", "")))
+        if w:
+            parts.append(w)
+    return "|".join(sorted(parts))
+
+
+def validate_vocabulary_15(
+    data: dict,
+    used_history: list,
+    recent_signatures: list,
+    extra: dict | None = None,
+) -> tuple[bool, str]:
+    extra = extra or {}
+    mode = extra.get("theme_mode", "atlas")
+    title = str(data.get("theme_title", "")).strip()
+    words = data.get("words")
+
+    if not title:
+        return False, "empty theme_title"
+    t_ua = str(data.get("theme_title_ua", "")).strip()
+    if len(t_ua) > 120:
+        return False, "theme_title_ua too long"
+    if mode in ("atlas", "holiday"):
+        exp = str(extra.get("theme_title", "")).strip()
+        if exp and _normalize_text(exp) != _normalize_text(title):
+            return False, "theme_title does not match expected"
+
+    if not isinstance(words, list) or len(words) != 15:
+        return False, "words must be a list of exactly 15 items"
+
+    seen = set()
+    for i, item in enumerate(words):
+        if not isinstance(item, dict):
+            return False, f"word #{i+1} invalid type"
+        w = str(item.get("word", "")).strip()
+        ipa = str(item.get("ipa", "")).strip()
+        ua = str(item.get("ua", "")).strip()
+        if not w or not ua:
+            return False, f"word #{i+1} empty word or ua"
+        if len(w) > 48:
+            return False, f"word #{i+1} too long"
+        if ipa.count("/") < 2:
+            return False, f"word #{i+1} ipa must be IPA in slashes"
+        if len(ua) > 120:
+            return False, f"word #{i+1} ua too long"
+        key = _normalize_text(w)
+        if not key:
+            return False, f"word #{i+1} empty after normalize"
+        if key in seen:
+            return False, "duplicate words"
+        seen.add(key)
+
+    sig = build_vocabulary_15_word_signature(words)
+    if not sig:
+        return False, "empty signature"
+    recent_norm = {_normalize_text(s) for s in recent_signatures}
+    if _normalize_text(sig) in recent_norm:
+        return False, "word set repeated recently"
+
+    return True, "ok"
+
+
+async def generate_vocabulary_15_content(
+    history: list,
+    extra: dict | None,
+    recent_signatures: list,
+    max_attempts: int = 3,
+) -> dict:
+    extra = extra or {}
+    last_reason = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        data = await generate_content("vocabulary_15", history, extra)
+        ok, reason = validate_vocabulary_15(data, history, recent_signatures, extra)
+        if ok:
+            if attempt > 1:
+                log.info(f"✅ vocabulary_15 validated on retry #{attempt}")
+            return data
+        last_reason = reason
+        preview = build_vocabulary_15_word_signature(data.get("words", []))[:120]
+        log.warning(f"⚠️ vocabulary_15 rejected (attempt {attempt}/{max_attempts}): {reason} | sig='{preview}'")
+        history = history + [preview or "reject"]
+
+    raise RuntimeError(f"vocabulary_15 failed validation after {max_attempts} attempts: {last_reason}")
+
+
+async def call_gemini(
+    api_key: str,
+    prompt: str,
+    model: str = "gemini-2.0-flash-lite",
+    max_output_tokens: int | None = None,
+) -> dict:
     """Викликає Gemini модель з конкретним API ключем."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    mt = max_output_tokens if max_output_tokens is not None else 1000
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 1000},
+        "generationConfig": {"temperature": 0.85, "maxOutputTokens": mt},
     }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1904,11 +2267,19 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
         log.error("❌ No Gemini API keys configured! Set GEMINI_API_KEY_1/2/3")
         raise RuntimeError("No Gemini API keys configured")
 
+    if rubric == "vocabulary_15":
+        max_tok = 3200
+    elif rubric == "photo_relax":
+        max_tok = 800
+    elif rubric == "interesting_cities":
+        max_tok = 1400
+    else:
+        max_tok = 1000
     for model in GEMINI_MODELS:
         for i, api_key in enumerate(GEMINI_API_KEYS, 1):
             try:
                 log.info(f"🔑 Trying {model} key {i}/{len(GEMINI_API_KEYS)} for [{rubric}]")
-                result = await call_gemini(api_key, prompt, model)
+                result = await call_gemini(api_key, prompt, model, max_output_tokens=max_tok)
                 log.info(f"✅ Content generated via {model} key {i} for [{rubric}]")
                 return result
             except RuntimeError as e:
@@ -2007,6 +2378,323 @@ body {{ width: 1080px; height: 1920px; overflow: hidden; font-family: 'Montserra
 <div class="bg"></div>
 <div class="bg-overlay"></div>
 <div class="content">{content_blocks}</div>
+</body>
+</html>"""
+
+
+def _normalize_photo_relax_sentences(data: dict) -> list[str] | None:
+    raw = data.get("sentences")
+    if not isinstance(raw, list) or len(raw) != 4:
+        return None
+    out = [str(x).strip() for x in raw]
+    if any(not x for x in out):
+        return None
+    return out
+
+
+def build_photo_relax_signature(sentences: list[str]) -> str:
+    return _normalize_text(" ".join(sentences))[:240]
+
+
+def validate_photo_relax(
+    data: dict,
+    used_history: list,
+    recent_signatures: list,
+    extra: dict | None = None,
+) -> tuple[bool, str]:
+    _ = used_history
+    _ = extra
+    sents = _normalize_photo_relax_sentences(data)
+    if not sents:
+        return False, "need exactly 4 non-empty sentences in sentences[]"
+    cy = re.compile(r"[\u0400-\u04FF]")
+    for i, s in enumerate(sents):
+        if len(s) > 300:
+            return False, f"sentence {i+1} too long"
+        if cy.search(s):
+            return False, "Cyrillic not allowed"
+    sig = build_photo_relax_signature(sents)
+    recent_norm = {_normalize_text(x) for x in recent_signatures if x}
+    if sig in recent_norm:
+        return False, "text too similar to recent post"
+    data["sentences"] = sents
+    return True, "ok"
+
+
+async def generate_photo_relax_content(
+    history: list,
+    extra: dict | None,
+    recent_signatures: list,
+    max_attempts: int = 3,
+) -> dict:
+    extra = extra or {}
+    last_reason = "unknown"
+    hist = list(history)
+    for attempt in range(1, max_attempts + 1):
+        data = await generate_content("photo_relax", hist, extra)
+        ok, reason = validate_photo_relax(data, hist, recent_signatures, extra)
+        if ok:
+            if attempt > 1:
+                log.info(f"✅ photo_relax validated on retry #{attempt}")
+            return data
+        last_reason = reason
+        preview = " ".join(str(x) for x in (data.get("sentences") or []))[:100]
+        log.warning(f"⚠️ photo_relax rejected (attempt {attempt}/{max_attempts}): {reason} | {preview}")
+        hist = hist + [preview or "reject"]
+    raise RuntimeError(f"photo_relax failed validation after {max_attempts} attempts: {last_reason}")
+
+
+def _has_emoji_or_flag(s: str) -> bool:
+    for ch in s:
+        o = ord(ch)
+        if 0x1F300 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF or 0x1F1E6 <= o <= 0x1F1FF:
+            return True
+    return False
+
+
+def _interesting_cities_place_key(city: str, country: str) -> str:
+    return _normalize_text(f"{city.strip()}|{country.strip()}")
+
+
+def build_interesting_cities_signature(data: dict) -> str:
+    city = str(data.get("city_name", "")).strip()
+    country = str(data.get("country", "")).strip()
+    paras = data.get("paragraphs") or []
+    highs = data.get("highlights") or []
+    body = " ".join(str(p) for p in paras) + " | " + " ".join(str(h) for h in highs)
+    return _normalize_text(f"{city}|{country}|{body}")[:400]
+
+
+def validate_interesting_cities(
+    data: dict,
+    used_history: list,
+    recent_signatures: list,
+    extra: dict | None = None,
+) -> tuple[bool, str]:
+    _ = used_history
+    extra = extra or {}
+    city = str(data.get("city_name", "")).strip()
+    country = str(data.get("country", "")).strip()
+    if not city or not country:
+        return False, "empty city_name or country"
+    pq = str(data.get("photo_query", "")).strip()
+    if not pq:
+        pq = f"{city} {country} city travel landscape architecture"
+    data["photo_query"] = pq
+    paras = data.get("paragraphs")
+    highs = data.get("highlights")
+    if not isinstance(paras, list) or not isinstance(highs, list):
+        return False, "paragraphs and highlights must be lists"
+    paras = [str(p).strip() for p in paras if str(p).strip()]
+    highs = [str(h).strip() for h in highs if str(h).strip()]
+    if not (3 <= len(paras) <= 5):
+        return False, "paragraphs must have 3–5 items"
+    if not (3 <= len(highs) <= 5):
+        return False, "highlights must have 3–5 items"
+    cy = re.compile(r"[\u0400-\u04FF]")
+    for block, label in [(paras, "paragraph"), (highs, "highlight")]:
+        for i, s in enumerate(block):
+            if len(s) > 320:
+                return False, f"{label} {i+1} too long"
+            if cy.search(s):
+                return False, "Cyrillic not allowed"
+            if _has_emoji_or_flag(s):
+                return False, "emoji/flags not allowed"
+    if cy.search(city) or cy.search(country) or _has_emoji_or_flag(city) or _has_emoji_or_flag(country):
+        return False, "city/country must be Latin letters only, no emoji"
+
+    pk = _interesting_cities_place_key(city, country)
+    banned = {_normalize_text(x) for x in (extra.get("banned_cities") or []) if x}
+    if pk in banned:
+        return False, "city already used (banned list)"
+
+    sig = build_interesting_cities_signature(
+        {"city_name": city, "country": country, "paragraphs": paras, "highlights": highs}
+    )
+    recent_norm = {_normalize_text(x) for x in recent_signatures if x}
+    if sig in recent_norm:
+        return False, "duplicate recent signature"
+
+    data["city_name"] = city
+    data["country"] = country
+    data["photo_query"] = pq
+    data["paragraphs"] = paras
+    data["highlights"] = highs
+    return True, "ok"
+
+
+async def generate_interesting_cities_content(
+    history: list,
+    extra: dict | None,
+    recent_signatures: list,
+    max_attempts: int = 3,
+) -> dict:
+    extra = extra or {}
+    last_reason = "unknown"
+    hist = list(history)
+    for attempt in range(1, max_attempts + 1):
+        data = await generate_content("interesting_cities", hist, extra)
+        ok, reason = validate_interesting_cities(data, hist, recent_signatures, extra)
+        if ok:
+            if attempt > 1:
+                log.info(f"✅ interesting_cities validated on retry #{attempt}")
+            return data
+        last_reason = reason
+        preview = f"{data.get('city_name')}|{data.get('country')}"
+        log.warning(
+            f"⚠️ interesting_cities rejected (attempt {attempt}/{max_attempts}): {reason} | {preview}"
+        )
+        hist = hist + [preview or "reject"]
+    raise RuntimeError(
+        f"interesting_cities failed validation after {max_attempts} attempts: {last_reason}"
+    )
+
+
+def build_interesting_cities(data: dict, photo_b64: str) -> str:
+    city = _safe_html(str(data.get("city_name", "")))
+    country = _safe_html(str(data.get("country", "")))
+    paras = data.get("paragraphs") or []
+    highs = data.get("highlights") or []
+    paras_html = "\n".join(
+        f'<p class="ic-para">{_safe_html(str(p))}</p>' for p in paras[:5]
+    )
+    li_html = "\n".join(
+        f'<li class="ic-li">{_safe_html(str(h))}</li>' for h in highs[:5]
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    width: 1080px;
+    height: 1920px;
+    overflow: hidden;
+    font-family: 'Montserrat', sans-serif;
+    background: #ebe6df;
+    display: flex;
+    flex-direction: column;
+  }}
+  .ic-photo {{
+    width: 1080px;
+    height: 1020px;
+    flex-shrink: 0;
+    background-image: url('data:image/jpeg;base64,{photo_b64}');
+    background-size: cover;
+    background-position: center;
+  }}
+  .ic-body {{
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    padding: 28px 44px 36px 44px;
+    background: #ebe6df;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 12px;
+    overflow: hidden;
+  }}
+  .ic-title {{
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1.25;
+    color: #1e1a17;
+    margin-bottom: 4px;
+  }}
+  .ic-para {{
+    font-size: 22px;
+    font-weight: 400;
+    line-height: 1.42;
+    color: #2a2520;
+    margin: 0 0 6px 0;
+  }}
+  .ic-ul {{
+    margin: 8px 0 0 0;
+    padding-left: 26px;
+    list-style-type: disc;
+  }}
+  .ic-li {{
+    font-size: 21px;
+    font-weight: 400;
+    line-height: 1.38;
+    color: #2a2520;
+    margin-bottom: 6px;
+  }}
+</style>
+</head>
+<body>
+  <div class="ic-photo" role="img" aria-label="City photo"></div>
+  <div class="ic-body">
+    <div class="ic-title">{city}, {country}</div>
+{paras_html}
+    <ul class="ic-ul">
+{li_html}
+    </ul>
+  </div>
+</body>
+</html>"""
+
+
+def build_photo_relax(data: dict, photo_b64: str) -> str:
+    sentences = data.get("sentences") or []
+    lines = []
+    for s in sentences[:4]:
+        lines.append(f'<p class="pr-line">{_safe_html(str(s))}</p>')
+    text_html = "\n".join(lines)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    width: 1080px;
+    height: 1920px;
+    overflow: hidden;
+    font-family: 'Montserrat', sans-serif;
+    background: #ebe6df;
+    display: flex;
+    flex-direction: column;
+  }}
+  .pr-photo {{
+    width: 1080px;
+    height: 1180px;
+    flex-shrink: 0;
+    background-image: url('data:image/jpeg;base64,{photo_b64}');
+    background-size: cover;
+    background-position: center;
+  }}
+  .pr-comment {{
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    padding: 40px 48px 52px 48px;
+    background: #ebe6df;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 16px;
+  }}
+  .pr-line {{
+    font-size: 30px;
+    font-weight: 400;
+    line-height: 1.48;
+    color: #2a2520;
+    margin: 0;
+  }}
+</style>
+</head>
+<body>
+  <div class="pr-photo" role="img" aria-label="Nature photo"></div>
+  <div class="pr-comment">
+{text_html}
+  </div>
 </body>
 </html>"""
 
@@ -2123,6 +2811,369 @@ def build_quote_motivation(data: dict, photo_b64: str) -> str:
   </div>"""
     return html_base(photo_b64, blocks)
 
+
+def build_vocabulary_15(data: dict) -> str:
+    """
+    Кремова картка в стилі EnglishCardsGenerator.html + авто-підгін шрифту (JS),
+    як fitTextInBox у генераторі: довгі слова/рядки зменшують базовий font-size, поки блок вміщується.
+    """
+    title_en = _safe_html(str(data.get("theme_title", "Vocabulary")).strip())
+    title_block = f'<p class="v15-heading"><strong>{title_en}</strong></p>'
+
+    words = data.get("words", [])[:15]
+    items: list[str] = []
+    for item in words:
+        if not isinstance(item, dict):
+            continue
+        w = _safe_html(str(item.get("word", "")).strip())
+        ipa_raw = str(item.get("ipa", "")).strip()
+        ipa_inner = _safe_html(_ipa_square_brackets(ipa_raw))
+        ua = _safe_html(str(item.get("ua", "")).strip())
+        items.append(
+            f'<li class="v15-li">{w} <span class="v15-ipa">[{ipa_inner}]</span> – {ua}</li>'
+        )
+    list_html = "\n".join(items)
+
+    return f"""<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,500&family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  :root {{
+    --ink: #2a2520;
+    --muted: #6b635c;
+    --gold-warm: #c9a84c;
+    --stone: #a69f98;
+    --cream: linear-gradient(160deg, #e8e2d9 0%, #f0ede9 45%, #d6d2ce 100%);
+  }}
+  body {{
+    width: 1080px;
+    height: 1920px;
+    overflow: hidden;
+    font-family: 'Cormorant Garamond', serif;
+    color: var(--ink);
+    background: #e8e2d9;
+  }}
+  .v15-card {{
+    position: relative;
+    width: 1080px;
+    height: 1920px;
+    background: var(--cream);
+    overflow: hidden;
+  }}
+  .v15-card::before {{
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    opacity: 0.5;
+    background-image: url('https://www.transparenttextures.com/patterns/cream-pixels.png');
+  }}
+  .v15-card::after {{
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    opacity: 0.2;
+    background-image:
+      radial-gradient(circle, var(--stone) 1px, transparent 1px),
+      radial-gradient(circle, var(--gold-warm) 1px, transparent 1px);
+    background-size: 40px 40px, 65px 65px;
+    background-position: 0 0, 20px 20px;
+  }}
+  .v15-inner {{
+    position: relative;
+    z-index: 2;
+    height: 100%;
+    min-height: 1920px;
+    box-sizing: border-box;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    align-content: stretch;
+    padding: 8% 7% 4.5%;
+  }}
+  .v15-brand {{
+    display: flex;
+    justify-content: flex-end;
+    align-items: baseline;
+    flex: 0 0 auto;
+    width: 100%;
+    margin-bottom: 2rem;
+    font-size: 12px;
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 300;
+    letter-spacing: 0.125em;
+    color: #0a0a0a;
+  }}
+  .v15-brand-stack {{
+    display: flex;
+    flex-wrap: wrap;
+    flex-direction: row;
+    justify-content: flex-end;
+    align-items: baseline;
+    gap: 0.25em;
+    line-height: 1.1;
+    max-width: 100%;
+  }}
+  .v15-brand-gold {{
+    font-style: italic;
+    font-weight: 300;
+    color: var(--gold-warm);
+  }}
+  .v15-main {{
+    min-height: 0;
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    padding: 6px 0 10px;
+    text-align: left;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }}
+  .v15-fit-root {{
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    width: 100%;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    box-sizing: border-box;
+  }}
+  .v15-fit-content {{
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+    font-size: 32px;
+    box-sizing: border-box;
+  }}
+  .v15-heading {{
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 700;
+    font-size: 1em;
+    line-height: 1.42;
+    color: var(--ink);
+    margin-bottom: 0.35em;
+    word-break: break-word;
+  }}
+  .v15-heading strong {{
+    font-weight: 700;
+  }}
+  .v15-rule {{
+    display: block;
+    height: 2px;
+    margin: 0.65em 0 0.85em;
+    border: 0;
+    background: rgba(42, 37, 32, 0.42);
+  }}
+  .v15-ol {{
+    list-style: decimal;
+    list-style-position: inside;
+    padding-left: 0;
+    margin: 0;
+    width: 100%;
+    max-width: 100%;
+    font-size: 1em;
+    font-weight: 600;
+    line-height: 1.42;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }}
+  .v15-li {{
+    margin: 0.12em 0;
+    padding-left: 0.15em;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }}
+  .v15-ipa {{
+    font-weight: 400;
+    color: var(--ink);
+    opacity: 0.92;
+  }}
+  .v15-tagline {{
+    font-family: 'Montserrat', sans-serif;
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.556em;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-align: center;
+    width: max-content;
+    max-width: 100%;
+    margin-left: auto;
+    margin-right: auto;
+    margin-top: 2rem;
+    padding: 0.15rem 12px 0;
+    line-height: 1.4;
+    flex-shrink: 0;
+  }}
+</style>
+</head>
+<body>
+<div class="v15-card">
+  <div class="v15-inner">
+    <div class="v15-brand">
+      <div class="v15-brand-stack">
+        <span>Improve Your</span><span class="v15-brand-gold">English</span>
+      </div>
+    </div>
+    <div class="v15-main">
+      <div class="v15-fit-root">
+        <div class="v15-fit-content">
+        {title_block}
+        <hr class="v15-rule" />
+        <ol class="v15-ol">
+          {list_html}
+        </ol>
+        </div>
+      </div>
+    </div>
+    <div class="v15-tagline">Learn • Grow • Succeed</div>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+# vocabulary_15: як EnglishCardsGenerator — бренд/теглайн через fitFontToMaxWidth; список — .v15-fit-content
+# (не .v15-fit-root). Верхня межа шрифту списку не фіксована 56px — інакше лишається порожнє місце по вертикалі.
+VOCABULARY_15_FIT_JS = """
+() => {
+  var BRAND_TAGLINE_WIDTH_FRAC = 0.5;
+  var BRAND_FONT_MAX_FRAC = 0.28;
+  var TAGLINE_FONT_MAX_FRAC = 0.2;
+
+  function fitFontToMaxWidth(sizeEl, measureEl, targetW, minPx, maxPx) {
+    if (!sizeEl || !measureEl || targetW <= 0) {
+      return;
+    }
+    var lo = minPx;
+    var hi = Math.max(minPx, maxPx);
+    var i = 0;
+    for (i = 0; i < 32; i++) {
+      var mid = (lo + hi) / 2;
+      sizeEl.style.fontSize = mid + "px";
+      void measureEl.offsetWidth;
+      var sw = measureEl.scrollWidth;
+      if (sw <= targetW) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    sizeEl.style.fontSize = lo + "px";
+  }
+
+  function fitsBox(box, w, h) {
+    var pad = 8;
+    return box.scrollWidth <= w + 2 && box.scrollHeight <= h - pad;
+  }
+
+  function fitOnce() {
+    var card = document.querySelector(".v15-card");
+    var main = document.querySelector(".v15-main");
+    var box = document.querySelector(".v15-fit-content");
+    var inner = document.querySelector(".v15-inner");
+    var brand = document.querySelector(".v15-brand");
+    var stack = document.querySelector(".v15-brand-stack");
+    var tag = document.querySelector(".v15-tagline");
+    if (!main || !box || !card) {
+      return { ok: false, reason: "missing_nodes" };
+    }
+    var cardW = Math.floor(card.clientWidth || 1080);
+    var targetHalf = Math.floor(cardW * BRAND_TAGLINE_WIDTH_FRAC);
+    fitFontToMaxWidth(brand, stack, targetHalf, 8, cardW * BRAND_FONT_MAX_FRAC);
+    if (tag) {
+      fitFontToMaxWidth(tag, tag, targetHalf, 6, cardW * TAGLINE_FONT_MAX_FRAC);
+    }
+    void inner && inner.offsetHeight;
+    void main.offsetHeight;
+
+    var mr = main.getBoundingClientRect();
+    var w = Math.floor(mr.width);
+    var h = Math.floor(mr.height);
+    if (h < 350 && inner) {
+      var ir = inner.getBoundingClientRect();
+      var bh = brand ? brand.getBoundingClientRect().height : 0;
+      var th = tag ? tag.getBoundingClientRect().height : 0;
+      h = Math.max(500, Math.floor(ir.height - bh - th - 48));
+    }
+    if (w < 200 || h < 350) {
+      return { ok: false, reason: "bad_box", w: w, h: h };
+    }
+    var MIN_PX = Math.max(18, Math.floor(cardW * 0.014));
+    var MAX_PX = Math.min(
+      Math.min(cardW * 0.095, (card.clientHeight || 1920) * 0.11),
+      Math.floor(h * 0.072),
+      Math.floor(w * 0.12)
+    );
+    if (MAX_PX <= MIN_PX) {
+      MAX_PX = MIN_PX + 20;
+    }
+    var lo = MIN_PX;
+    var hi = MAX_PX;
+    var j = 0;
+    for (j = 0; j < 52; j++) {
+      var mid = (lo + hi) / 2;
+      box.style.fontSize = mid + "px";
+      void box.offsetHeight;
+      if (fitsBox(box, w, h)) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    box.style.fontSize = lo + "px";
+    void box.offsetHeight;
+    if (!fitsBox(box, w, h)) {
+      var s = lo;
+      for (var k = 0; k < 48; k++) {
+        s -= 0.75;
+        if (s < 14) {
+          break;
+        }
+        box.style.fontSize = s + "px";
+        void box.offsetHeight;
+        if (fitsBox(box, w, h)) {
+          lo = s;
+          break;
+        }
+      }
+    }
+    return {
+      ok: true,
+      w: w,
+      h: h,
+      fontPx: Math.round(lo * 100) / 100,
+      scrollH: box.scrollHeight,
+      scrollW: box.scrollWidth,
+      mainClientH: main.clientHeight,
+      brandPx: brand ? Math.round(parseFloat(getComputedStyle(brand).fontSize) * 100) / 100 : null,
+      tagPx: tag ? Math.round(parseFloat(getComputedStyle(tag).fontSize) * 100) / 100 : null,
+    };
+  }
+  var fontsReady = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+  return fontsReady.then(function () {
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          resolve(fitOnce());
+        });
+      });
+    });
+  });
+}
+"""
+
+
 # ──────────────────────────────────────────────
 # PLAYWRIGHT — HTML → PNG
 # ──────────────────────────────────────────────
@@ -2133,7 +3184,18 @@ async def render_card(html: str) -> bytes:
         try:
             page = await browser.new_page(viewport={"width": 1080, "height": 1920})
             await page.set_content(html, wait_until="networkidle")
-            await asyncio.sleep(1.0)
+            if "v15-fit-content" in html:
+                try:
+                    r1 = await page.evaluate(VOCABULARY_15_FIT_JS)
+                    log.info(f"📐 vocabulary_15 fit [1]: {r1}")
+                    await asyncio.sleep(0.05)
+                    r2 = await page.evaluate(VOCABULARY_15_FIT_JS)
+                    log.info(f"📐 vocabulary_15 fit [2]: {r2}")
+                except Exception as e:
+                    log.warning(f"⚠️ vocabulary_15 font-fit evaluate: {e}")
+                await asyncio.sleep(0.5)
+            else:
+                await asyncio.sleep(1.0)
             png_bytes = await page.screenshot(type="png", full_page=False)
         finally:
             await browser.close()
@@ -2311,61 +3373,141 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
             log.info(f"📣 [NF] quote_motivation theme selected | index={theme_idx} | name='{theme['name']}'")
             photo_query = await get_quote_photo_query(history_mgr)
 
-        log.info(f"🔍 Photo query for [{rubric}]: '{photo_query}'")
+        elif rubric == "vocabulary_15":
+            theme_pick = await pick_vocabulary_15_theme(history_mgr)
+            extra = {**theme_pick, "cefr_band": "A2-B1 mixed"}
+            log.info(
+                f"📚 vocabulary_15 theme_mode={extra.get('theme_mode')} | "
+                f"title='{extra.get('theme_title', '')[:80]}'"
+            )
 
-        # 2. Завантажуємо фото (situation: use_topics=True — кураторські колекції дають менше «сірого» урбану)
-        use_topics = True
-        photo_url = await fetch_photo(photo_query, use_topics=use_topics)
-        recent_photo_urls = await history_mgr.get_recent_photo_urls(rubric, limit=PHOTO_URL_CHECK_WINDOW)
-        for _ in range(PHOTO_URL_REFETCH_ATTEMPTS):
-            if photo_url and photo_url in set(recent_photo_urls):
-                log.warning(f"⚠️ Repeated photo URL detected for [{rubric}] — refetching")
-                if rubric == "situation_phrases":
-                    refetch_q = f"{photo_query} alternate framing {random.choice(SITUATION_WARM_COLOR_MOODS)}"
+        elif rubric == "photo_relax":
+            extra = await pick_photo_relax_theme(history_mgr)
+            photo_query = extra["photo_query"]
+            log.info(f"🌿 photo_relax visual_theme={extra.get('theme_id')} query='{photo_query}'")
+
+        elif rubric == "interesting_cities":
+            extra = {}
+
+        photo_url = None
+        photo_b64 = None
+        ic_data = None
+
+        if rubric == "interesting_cities":
+            history_ic = await history_mgr.get_used(rubric)
+            recent_ic_sig = await history_mgr.get_recent_signatures(
+                rubric, limit=QUIZ_SIGNATURE_CHECK_WINDOW
+            )
+            banned = await history_mgr.get_interesting_cities_banned()
+            extra["banned_cities"] = banned
+            log.info(f"🏙️ interesting_cities banned places in Redis: {len(banned)}")
+            ic_data = await generate_interesting_cities_content(
+                history_ic, extra, recent_ic_sig, max_attempts=3
+            )
+            photo_query = str(ic_data.get("photo_query", "")).strip()
+            if not photo_query:
+                photo_query = (
+                    f"{ic_data.get('city_name', '')} {ic_data.get('country', '')} city travel landscape"
+                )
+            log.info(f"🔍 Photo query for [interesting_cities]: '{photo_query}'")
+            use_topics_ic = True
+            photo_url = await fetch_photo(
+                photo_query, use_topics=use_topics_ic, pick_random=True
+            )
+            recent_photo_urls = await history_mgr.get_recent_photo_urls(rubric, limit=PHOTO_URL_CHECK_WINDOW)
+            for _ in range(PHOTO_URL_REFETCH_ATTEMPTS):
+                if photo_url and photo_url in set(recent_photo_urls):
+                    log.warning(f"⚠️ Repeated photo URL detected for [{rubric}] — refetching")
+                    refetch_q = (
+                        f"{photo_query} cityscape landmark "
+                        f"{random.choice(['street', 'skyline', 'old town', 'waterfront', 'architecture'])}"
+                    )
+                    photo_url = await fetch_photo(
+                        refetch_q, use_topics=use_topics_ic, pick_random=True
+                    )
                 else:
-                    refetch_q = photo_query
-                photo_url = await fetch_photo(refetch_q, use_topics=use_topics)
-            else:
-                break
-        if not photo_url:
-            log.error(f"❌ No photo available for [{rubric}] — SKIPPING POST")
-            return
+                    break
+            if not photo_url:
+                log.error(f"❌ No photo available for [{rubric}] — SKIPPING POST")
+                return
+            photo_bytes = await download_photo(photo_url)
+            if not photo_bytes:
+                log.error(f"❌ Photo download failed for [{rubric}] — SKIPPING POST")
+                return
+            import base64
 
-        photo_bytes = await download_photo(photo_url)
-        if not photo_bytes:
-            log.error(f"❌ Photo download failed for [{rubric}] — SKIPPING POST")
-            return
+            photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
+            log.info(f"✅ Photo ready for [{rubric}]: {len(photo_bytes)//1024}KB")
 
-        import base64
-        photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
-        log.info(f"✅ Photo ready for [{rubric}]: {len(photo_bytes)//1024}KB")
-
-        # 3. Генеруємо контент
-        history = await history_mgr.get_used(rubric)
-        log.info(f"🤖 Generating content for [{rubric}]...")
-        if rubric == "quote_motivation":
-            data = await generate_quote_motivation_content(history, extra, max_attempts=3)
+        elif rubric == "vocabulary_15":
+            log.info("🎨 vocabulary_15: cream card (EnglishCardsGenerator style, no Unsplash photo)")
         else:
-            data = await generate_content(rubric, history, extra)
+            log.info(f"🔍 Photo query for [{rubric}]: '{photo_query}'")
+
+            # 2. Завантажуємо фото (situation: use_topics=True — кураторські колекції дають менше «сірого» урбану)
+            use_topics = rubric != "photo_relax"
+            # daily_phrase: один і той самий запит часто дає той самий «переможець» Unsplash — тягнемо випадковий з топу
+            pick_first = rubric == "daily_phrase"
+            pick_rand = pick_first or rubric == "photo_relax"
+            photo_url = await fetch_photo(photo_query, use_topics=use_topics, pick_random=pick_rand)
+            recent_photo_urls = await history_mgr.get_recent_photo_urls(rubric, limit=PHOTO_URL_CHECK_WINDOW)
+            for _ in range(PHOTO_URL_REFETCH_ATTEMPTS):
+                if photo_url and photo_url in set(recent_photo_urls):
+                    log.warning(f"⚠️ Repeated photo URL detected for [{rubric}] — refetching")
+                    if rubric == "situation_phrases":
+                        refetch_q = f"{photo_query} alternate framing {random.choice(SITUATION_WARM_COLOR_MOODS)}"
+                    elif rubric == "daily_phrase":
+                        refetch_q = f"{photo_query} {random.choice(DAILY_PHOTO_REFETCH_TAGS)}"
+                    elif rubric == "quote_motivation":
+                        refetch_q = f"{photo_query} different mood variation natural"
+                    elif rubric == "photo_relax":
+                        refetch_q = f"{photo_query} scenic landscape nature {random.choice(['peaceful', 'serene', 'wild', 'pristine'])}"
+                    else:
+                        refetch_q = photo_query
+                    photo_url = await fetch_photo(refetch_q, use_topics=use_topics, pick_random=True)
+                else:
+                    break
+            if not photo_url:
+                log.error(f"❌ No photo available for [{rubric}] — SKIPPING POST")
+                return
+
+            photo_bytes = await download_photo(photo_url)
+            if not photo_bytes:
+                log.error(f"❌ Photo download failed for [{rubric}] — SKIPPING POST")
+                return
+
+            import base64
+            photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
+            log.info(f"✅ Photo ready for [{rubric}]: {len(photo_bytes)//1024}KB")
+
+        # 3. Генеруємо контент (interesting_cities уже згенеровано перед фото)
+        if ic_data is not None:
+            data = ic_data
+            log.info(f"🤖 Content pre-generated for [interesting_cities]")
+        else:
+            history = await history_mgr.get_used(rubric)
+            log.info(f"🤖 Generating content for [{rubric}]...")
+            if rubric == "quote_motivation":
+                data = await generate_quote_motivation_content(history, extra, max_attempts=3)
+            elif rubric == "vocabulary_15":
+                recent_vocab_sig = await history_mgr.get_recent_signatures(
+                    "vocabulary_15", limit=QUIZ_SIGNATURE_CHECK_WINDOW
+                )
+                data = await generate_vocabulary_15_content(
+                    history, extra, recent_vocab_sig, max_attempts=3
+                )
+            elif rubric == "photo_relax":
+                recent_pr = await history_mgr.get_recent_signatures(
+                    "photo_relax", limit=QUIZ_SIGNATURE_CHECK_WINDOW
+                )
+                data = await generate_photo_relax_content(
+                    history, extra, recent_pr, max_attempts=3
+                )
+            else:
+                data = await generate_content(rubric, history, extra)
         log.info(f"✅ Content: {json.dumps(data, ensure_ascii=False)[:200]}")
 
-        # Якщо Gemini повернув кращий photo_query — оновлюємо фото
-        ai_photo_query = data.get("photo_query", "").strip()
-        # Для daily_phrase/situation_phrases тримаємо контрольований стиль, тому AI photo_query не застосовуємо.
-        if rubric in {"daily_phrase", "situation_phrases", "quote_motivation"} and ai_photo_query and ai_photo_query != photo_query:
-            log.info(f"🎨 {rubric}: skip AI photo query to keep controlled style | ai='{ai_photo_query}'")
-            ai_photo_query = ""
-
-        if ai_photo_query and ai_photo_query != photo_query:
-            log.info(f"🎨 AI photo query: '{ai_photo_query}' — fetching better photo")
-            better_url = await fetch_photo(ai_photo_query, use_topics=use_topics)
-            if better_url:
-                better_bytes = await download_photo(better_url)
-                if better_bytes:
-                    photo_b64 = base64.b64encode(better_bytes).decode("utf-8")
-                    log.info(f"✅ Better photo loaded: {len(better_bytes)//1024}KB")
-
-        # 4. Будуємо HTML
+        # 4. Будуємо HTML (фон з фото або кремова картка vocabulary_15)
         if rubric == "daily_phrase":
             html = build_daily_phrase(data, photo_b64)
         elif rubric == "situation_phrases":
@@ -2373,6 +3515,12 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
             html = build_situation_phrases(data, photo_b64, cat)
         elif rubric == "quote_motivation":
             html = build_quote_motivation(data, photo_b64)
+        elif rubric == "vocabulary_15":
+            html = build_vocabulary_15(data)
+        elif rubric == "photo_relax":
+            html = build_photo_relax(data, photo_b64)
+        elif rubric == "interesting_cities":
+            html = build_interesting_cities(data, photo_b64)
         else:
             log.error(f"❌ Unknown image rubric: {rubric}")
             return
@@ -2396,6 +3544,35 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
                 quote_preview = str(data.get("quote_en", "")).strip()[:120]
                 log.info(f"📣 [NF] quote_motivation published | theme='{theme_name}' | quote='{quote_preview}'")
                 await history_mgr.advance_quote_theme_index()
+            if rubric == "vocabulary_15":
+                tt = str(data.get("theme_title", "")).strip()
+                if tt:
+                    try:
+                        await history_mgr.r.lpush("used:vocabulary_15_themes", tt)
+                        await history_mgr.r.ltrim("used:vocabulary_15_themes", 0, 199)
+                    except Exception as e:
+                        log.error(f"❌ vocabulary_15 theme history: {e}")
+                ws = data.get("words", [])
+                sig = build_vocabulary_15_word_signature(ws)
+                if sig:
+                    await history_mgr.add_signature("vocabulary_15", sig)
+            if rubric == "photo_relax":
+                await history_mgr.advance_photo_relax_theme_index()
+                ss = data.get("sentences") or []
+                if isinstance(ss, list) and len(ss) == 4:
+                    await history_mgr.add_signature(
+                        "photo_relax", build_photo_relax_signature([str(x) for x in ss])
+                    )
+            if rubric == "interesting_cities":
+                pk = _interesting_cities_place_key(
+                    str(data.get("city_name", "")),
+                    str(data.get("country", "")),
+                )
+                if pk:
+                    await history_mgr.add_interesting_city_place(pk)
+                await history_mgr.add_signature(
+                    "interesting_cities", build_interesting_cities_signature(data)
+                )
 
         elapsed = time.time() - start_time
         log.info(f"⏱️ [{rubric}] completed in {elapsed:.1f}s | success={success}")
@@ -2525,8 +3702,15 @@ async def publish_quiz(rubric: str, redis_client: UpstashRedis):
         await history_mgr.release_lock(rubric)
 
 
+async def publish_placeholder_rubric(rubric: str, redis_client: UpstashRedis) -> None:
+    _ = redis_client
+    log.warning(f"⏭️ [{rubric}] — rubric scheduled but not implemented yet; skipping publish")
+
+
 async def publish_card(rubric: str, redis_client: UpstashRedis):
-    if rubric in QUIZ_RUBRICS:
+    if rubric in PLACEHOLDER_RUBRICS:
+        await publish_placeholder_rubric(rubric, redis_client)
+    elif rubric in QUIZ_RUBRICS:
         await publish_quiz(rubric, redis_client)
     else:
         await publish_image_card(rubric, redis_client)
@@ -2537,9 +3721,41 @@ async def publish_card(rubric: str, redis_client: UpstashRedis):
 # ──────────────────────────────────────────────
 _redis_client_global: "UpstashRedis | None" = None
 
-VALID_RUBRICS = list(SCHEDULE.values())
+VALID_RUBRICS = sorted(
+    set(WEEKDAY_10_00.values())
+    | {r for _, r in QUIZ_SLOTS}
+    | set(WEEKEND_16_00.values())
+)
 
 RUBRIC_HELP = "\n".join(f"  /test/{r}" for r in VALID_RUBRICS)
+
+# Документація для GET / — усі заплановані рубрики (тест: GET /test/{rubric})
+TEST_ENDPOINTS_DOC = f"""English A2 Bot v2.0 — OK
+
+Manual test: GET /test/{{rubric}} — одноразово запускає публікацію (перевірте Telegram).
+
+Пн–Пт 10:00 Europe/Kyiv — великі пости (PNG):
+  quote_motivation     — цитата / мотивація + фото
+  vocabulary_15        — 15 слів + IPA (кремова картка)
+  daily_phrase         — фраза дня + приклад (en) + переклад (ua)
+  situation_phrases    — 5 фраз (en/ua) для життєвої ситуації
+  photo_relax          — природа (фото) + 4 речення (en) під знімком
+
+Пн–Пт — квізи (Telegram poll):
+  grammar_quiz           (11:30)
+  vocabulary_quiz        (13:00)
+  confusing_words_quiz   (14:30)
+  prepositions_quiz      (16:00)
+
+Сб 16:00 Europe/Kyiv — PNG (картка як photo_relax):
+  interesting_cities   — місто + країна, фото + текст (en) + bullet-підсумки
+
+Нд 16:00 — заплановано доробити (зараз заглушка, пост не генерується):
+  travel_video
+
+Повний список шляхів для копіювання:
+{RUBRIC_HELP}
+"""
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -2549,9 +3765,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         # GET / — health check
         if path == "" or path == "/":
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            body = "English A2 Bot v2.0 - OK\n\nTest endpoints:\n" + RUBRIC_HELP + "\n"
-            self.wfile.write(body.encode("utf-8"))
+            self.wfile.write(TEST_ENDPOINTS_DOC.encode("utf-8"))
             return
 
         # GET /test/{rubric}
@@ -2559,13 +3775,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             rubric = path[6:]  # все після /test/
             if rubric not in VALID_RUBRICS:
                 self.send_response(400)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
-                msg = f"Unknown rubric: '{rubric}'\nValid rubrics:\n{RUBRIC_HELP}\n"
-                self.wfile.write(msg.encode())
+                msg = f"Unknown rubric: '{rubric}'\n\nSee GET / for the full list.\n\n{RUBRIC_HELP}\n"
+                self.wfile.write(msg.encode("utf-8"))
                 log.warning(f"⚠️ /test/ called with unknown rubric: '{rubric}'")
                 return
 
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(f"⏳ Triggering [{rubric}]... check Telegram!\n".encode())
             log.info(f"🧪 Manual test triggered via HTTP: [{rubric}]")
@@ -2596,7 +3814,7 @@ def start_health_server():
     port   = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     log.info(f"🌐 HTTP server running on port {port}")
-    log.info(f"🧪 Test endpoints available: /test/{{rubric}}")
+    log.info("🧪 GET / — список рубрик; GET /test/{rubric} — тестовий пост")
     server.serve_forever()
 
 
@@ -2604,24 +3822,24 @@ def start_health_server():
 # ПЛАНУВАЛЬНИК
 # ──────────────────────────────────────────────
 async def scheduler(redis_client: UpstashRedis):
-    log.info("⏰ Scheduler started")
-    published_today: set = set()
+    log.info("⏰ Scheduler started (Europe/Kyiv)")
+    published_slots: set[str] = set()
 
     while True:
-        now  = datetime.now()
-        hour = now.hour
+        now = datetime.now(TZ)
+        slot_key = f"{now.date().isoformat()}|{now.hour:02d}:{now.minute:02d}"
 
-        if hour == 0 and now.minute == 0:
-            published_today.clear()
-            log.info("🔄 Reset published_today for new day")
+        if now.hour == 0 and now.minute == 0:
+            published_slots.clear()
+            log.info("🔄 Reset published_slots for new calendar day (Kyiv)")
 
-        if hour in SCHEDULE and hour not in published_today:
-            rubric = SCHEDULE[hour]
-            published_today.add(hour)
-            log.info(f"⏰ Triggering [{rubric}] at {now.strftime('%H:%M')}")
+        rubric = get_rubric_for_datetime(now)
+        if rubric and slot_key not in published_slots:
+            published_slots.add(slot_key)
+            log.info(f"⏰ Triggering [{rubric}] at {now.strftime('%Y-%m-%d %H:%M')} Kyiv")
             asyncio.create_task(publish_card(rubric, redis_client))
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 # ──────────────────────────────────────────────
@@ -2634,10 +3852,13 @@ async def main():
     _get_required_env("TELEGRAM_CHAT_ID")
 
     log.info("🤖 English A2 Bot v2.0 starting...")
-    log.info(f"📋 Schedule: {SCHEDULE}")
+    log.info(
+        f"📋 Schedule Kyiv: Mon–Fri 10:00 {WEEKDAY_10_00}, "
+        f"quizzes {QUIZ_SLOTS}, weekend {WEEKEND_16_00}"
+    )
     log.info(f"🖼️ Image rubrics: {IMAGE_RUBRICS}")
     log.info(f"📝 Quiz rubrics: {QUIZ_RUBRICS}")
-    log.info(f"🧪 Test endpoints: /test/<rubric> — valid: {VALID_RUBRICS}")
+    log.info("🧪 HTTP: GET / — опис усіх тестових рубрик; GET /test/<rubric> — ручний запуск")
 
     redis_client = UpstashRedis()
     try:
