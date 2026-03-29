@@ -162,6 +162,45 @@ PHOTO_RELAX_THEMES: list[dict] = [
     {"id": "waterfall", "label": "a waterfall (water, rocks, mist)", "photo_query": "waterfall nature forest rocks"},
 ]
 
+# Стиль тексту для п’ятничного photo_relax (ротація окремо від теми фото)
+PHOTO_RELAX_VOICE_STYLES: list[dict] = [
+    {
+        "id": "romantic_poetic",
+        "instruction": (
+            "Voice: romantic / gently poetic. Use simple imagery or a soft metaphor; keep sentences easy to read. "
+            "Sound intimate and unhurried, never grand or theatrical."
+        ),
+    },
+    {
+        "id": "minimal_modern",
+        "instruction": (
+            "Voice: minimal / modern. Four short sentences, very lean wording, stylish and a little reflective. "
+            "No filler; each line should feel clean and quiet."
+        ),
+    },
+    {
+        "id": "instagram_lifestyle",
+        "instruction": (
+            "Voice: Instagram / lifestyle. Warm and close, as if you are sharing a real moment with friends. "
+            "Natural, conversational, a bit upbeat about slowing down."
+        ),
+    },
+    {
+        "id": "calm_therapeutic",
+        "instruction": (
+            "Voice: calm / grounding. Soft reminder to breathe, slow down, and feel a little lighter after the week. "
+            "Gentle, reassuring, like a kind note to yourself — not clinical."
+        ),
+    },
+    {
+        "id": "escape_travel",
+        "instruction": (
+            "Voice: small escape / wanderlust. Light wish to pause routine, change the view, or feel a bit of freedom. "
+            "Hopeful and light, not a travel brochure."
+        ),
+    },
+]
+
 # ──────────────────────────────────────────────
 # SITUATION PHRASES — 18 КАТЕГОРІЙ (РОТАЦІЯ)
 # ──────────────────────────────────────────────
@@ -1035,22 +1074,30 @@ async def pick_vocabulary_15_theme(history_mgr: "HistoryManager") -> dict:
         "theme_mode": "gemini_freeform",
         "theme_title": "",
         "theme_scope": (
-            "Invent ONE clear English title for this post (3–12 words), e.g. "
-            "'15 action verbs for everyday life', '15 adjectives to describe people', "
-            "'15 phrasal verbs about travel'. Then list exactly 15 items matching that title."
+            "Invent ONE clear English title for this post (3–12 words) WITHOUT the numeral 15 in the title — "
+            "the list is already numbered on the card. Examples: "
+            "'Action verbs for everyday life', 'Adjectives to describe people', "
+            "'Phrasal verbs about travel'. Then list exactly 15 items matching that title."
         ),
     }
 
 
 async def pick_photo_relax_theme(history_mgr: "HistoryManager") -> dict:
-    """Ротація тем природи для п’ятниці photo_relax (індекс зсувається після успішного поста)."""
+    """Ротація тем природи + стилю тексту для п’ятниці photo_relax (індекси після успішного поста)."""
     idx = await history_mgr.get_photo_relax_theme_index()
     t = PHOTO_RELAX_THEMES[idx]
-    log.info(f"🌿 photo_relax theme idx={idx} id={t['id']} query='{t['photo_query']}'")
+    vidx = await history_mgr.get_photo_relax_voice_style_index()
+    vs = PHOTO_RELAX_VOICE_STYLES[vidx]
+    log.info(
+        f"🌿 photo_relax theme idx={idx} id={t['id']} query='{t['photo_query']}' | "
+        f"voice_style={vs['id']}"
+    )
     return {
         "visual_theme": t["label"],
         "photo_query": t["photo_query"],
         "theme_id": t["id"],
+        "voice_style_id": vs["id"],
+        "voice_style_instruction": vs["instruction"],
     }
 
 
@@ -1266,6 +1313,24 @@ class HistoryManager:
             log.info(f"🌿 photo_relax theme index advanced: {current} → {next_idx}")
         except Exception as e:
             log.error(f"❌ Redis advance_photo_relax_theme_index error: {e}")
+
+    async def get_photo_relax_voice_style_index(self) -> int:
+        try:
+            val = await self.r.get("photo_relax:voice_style_index")
+            idx = int(val) if val is not None else 0
+            return idx % len(PHOTO_RELAX_VOICE_STYLES)
+        except Exception as e:
+            log.error(f"❌ Redis get_photo_relax_voice_style_index error: {e} — using index 0")
+            return 0
+
+    async def advance_photo_relax_voice_style_index(self):
+        try:
+            current = await self.get_photo_relax_voice_style_index()
+            next_idx = (current + 1) % len(PHOTO_RELAX_VOICE_STYLES)
+            await self.r.set("photo_relax:voice_style_index", str(next_idx))
+            log.info(f"🌿 photo_relax voice style index advanced: {current} → {next_idx}")
+        except Exception as e:
+            log.error(f"❌ Redis advance_photo_relax_voice_style_index error: {e}")
 
     async def get_travel_video_banned_places(self) -> list[str]:
         try:
@@ -2724,6 +2789,7 @@ Rules:
         if mode == "gemini_freeform":
             mode_rules = (
                 "You MUST invent theme_title yourself (English, 3–12 words) and build 15 words that match it.\n"
+                "theme_title MUST NOT contain the numeral 15 or phrases like '15 words' — the card already shows 15 numbered items.\n"
             )
         else:
             mode_rules = (
@@ -2745,6 +2811,7 @@ Return ONLY valid JSON, no markdown, no extra text:
 }}
 Rules:
 - "theme_title_ua": optional; card heading shows only "theme_title" in English
+- "theme_title" must be a thematic heading only — do NOT put the numeral 15 in it (no '15 words', '15 verbs', etc.)
 - Exactly 15 items in "words"
 - Each "ipa" MUST be IPA inside slashes, e.g. /ˈwɜːrd/ — American or British is OK but be consistent within the list
 - Single words preferred; two-word items only if idiomatic (e.g. phrasal verbs)
@@ -2756,9 +2823,17 @@ Rules:
     if rubric == "photo_relax":
         visual = str(extra.get("visual_theme", "nature landscape")).strip()
         tid = str(extra.get("theme_id", "")).strip()
-        return f"""You are an English teacher writing a short calm post for Ukrainian students learning English.
-The Telegram image will show ONLY nature / landscape photography matching this visual focus: {visual}
-(theme id for consistency: {tid})
+        vstyle = str(extra.get("voice_style_instruction", "")).strip()
+        if not vstyle:
+            vstyle = PHOTO_RELAX_VOICE_STYLES[0]["instruction"]
+        return f"""You write short English captions for a nature photo — like a real person, not a textbook.
+Context: this post goes out on a Friday for people who need to breathe out after the week. The image is ONLY nature / landscape matching: {visual} (theme id: {tid}).
+
+Writing style for THIS post (follow closely):
+{vstyle}
+
+Overall mood to capture: relief after the week, quiet, a little dreamy, the feeling that the weekend is near — inner "exhale", space to rest or imagine a small getaway. Warm, alive, lightly poetic sometimes, but NO pomposity, NO clichés like "this place will take your breath away" or "hidden gem".
+
 {history_note}
 Return ONLY valid JSON, no markdown, no extra text:
 {{
@@ -2770,15 +2845,14 @@ Return ONLY valid JSON, no markdown, no extra text:
   ]
 }}
 Rules:
-- Output MUST be English only (no Ukrainian, no Russian).
-- Exactly 4 separate strings in "sentences" (4 sentences total).
-- CEFR A2 ONLY: very simple, high-frequency words; short sentences; mostly present simple; avoid rare words, idioms, and long or complex grammar.
-- Tone: calm, soft, relaxing; you may also use a light neutral / descriptive tone sometimes.
-- Content should fit the visual theme above (sea, forest, mountains, lake, or waterfall — as described). Do NOT centre the text on rain, evening, night, cities, streets, or people.
-- You may use "you" sometimes, or write without addressing the reader — both are fine.
-- Do not start with the same opening pattern as in the recent history hints above.
-- No hashtags, no emojis unless absolutely necessary (prefer none).
-- No lists inside a sentence; each array item is one complete sentence."""
+- English ONLY (no Ukrainian, no Russian).
+- Exactly 4 separate strings in "sentences" — four full sentences total.
+- Clear, natural English (roughly A2–B1): mostly simple grammar; you may use a slightly richer word here if it fits the tone — still easy for learners.
+- Match the nature scene above; do NOT centre the text on rain, night, cities, streets, or crowds of people.
+- You may use "you" or stay neutral — your choice.
+- Do not repeat the same opening hook as in the recent history hints above.
+- No hashtags; no emojis (prefer none).
+- No bullet lists inside a sentence; each array item is one complete sentence."""
 
     if rubric == "interesting_cities":
         banned = extra.get("banned_cities") or []
@@ -2788,41 +2862,42 @@ Rules:
                 f"\nDo NOT choose any of these city+country pairs again "
                 f"(same idea, even if spelling varies): {banned[-40:]}\n"
             )
-        return f"""You are a travel blogger and an English teacher. Write in a MINIMALIST style: short, clear, no filler.
-Your readers are Ukrainian students; the post must help them read simple travel English.
+        return f"""You are a travel blogger and an English teacher. You write lively, emotional posts in English for Telegram and Instagram — like a real person, not a guidebook or Wikipedia.
+Your style:
+— conversational, warm, a little intimate; sometimes light humour
+— no pomposity; avoid empty clichés like "this city will enchant you", "hidden gem", "must-visit destination", "breathtaking" without a real detail
+— as if you're texting a friend, not selling a tour
+— no dry facts, years, or dates; no encyclopaedic tone
+
+Task: write ONE post about ONE place — it can be a city, a small town, or a capital.
+
 {banned_note}{history_note}
 Return ONLY valid JSON, no markdown, no extra text:
 {{
-  "city_name": "English name of the city",
+  "city_name": "English name of the place",
   "country": "English name of the country",
-  "photo_query": "compact English keywords for stock photo search (city + country + one visual cue; avoid keyword spam)",
-  "hook": "One short sentence only — the hook (mood, contrast, or what pulls you in).",
-  "famous_for": [
-    "Short fact 1 (food, architecture, history, or mood).",
-    "Short fact 2 (omit this string if one fact is enough — then use an array of length 1 only)."
+  "photo_query": "compact English keywords for stock photo search (place + country + one visual cue; avoid keyword spam)",
+  "hook": "Short emotional hook: 1–2 sentences only.",
+  "what_makes_it_special": "One paragraph: what feels special here — concrete and fresh, not generic.",
+  "experiences": [
+    "Each string: one specific place, moment, or thing to do — natural sentences, 2 to 4 strings total.",
+    "Another experience..."
   ],
-  "sights": [
-    "Best place or view 1.",
-    "Best place or view 2.",
-    "Best place or view 3."
-  ],
-  "why_visit": "One closing sentence: emotion + benefit (e.g. Perfect for those who want a quiet weekend / cheap food / old streets — pick one angle)."
+  "personal_note": "A small personal reaction or feeling (one short paragraph).",
+  "closing": "A light ending OR a simple question to the reader (one short paragraph)."
 }}
-Structure (content must follow this logic in the JSON fields):
-1) Title in the channel will be city + country (use city_name + country).
-2) hook — one sentence only.
-3) famous_for — 1 or 2 strings (each string is one fact; if two facts, use two short strings).
-4) sights — exactly 3 strings; only the strongest places or views.
-5) why_visit — one closing line: why go (feeling + use).
+Structure:
+— The Telegram caption title line will be: city_name + country (no extra title field).
+— "experiences" must contain between 2 and 4 non-empty strings. Do NOT prefix lines with "1." "2." or bullets; write full sentences only.
+— Flow: hook → what_makes_it_special → experiences (each string is its own mini-bit) → personal_note → closing.
+
 Rules:
-- English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols, no decorative bullets in the text.
-- CEFR A2 ONLY: very simple words and grammar; short sentences; present simple mostly; avoid rare words and long clauses.
-- Minimalism: cut every line until it is still clear; no "as we all know", no tourist brochure clichés without a concrete detail.
-- Pick ONE interesting city anywhere in the world — not always a capital. Vary continents over time. Be specific (one concrete detail beats vague praise).
-- "famous_for" must be an array of 1 or 2 non-empty strings.
-- "sights" must be an array of EXACTLY 3 non-empty strings (locations or very short labels).
-- "photo_query": keywords that would find a strong cityscape/architecture/street photo of THAT city (Unsplash/Pexels/Pixabay).
-- Do not repeat cities from the banned list above."""
+- English ONLY in all fields (no Ukrainian, no Russian). No emoji, no flag symbols.
+- Natural spoken English (B1-ish): mix of short and medium sentences; still clear for learners — avoid rare jargon.
+- No numbered lists inside any string (no "1.", "2.", "First:", "Second:" as list markers).
+- Pick ONE interesting place anywhere in the world — vary continents over time. Be specific.
+- "photo_query": keywords for a strong photo of THAT place (Unsplash/Pexels/Pixabay).
+- Do not repeat places from the banned list above."""
 
     if rubric == "travel_video_landmark":
         banned = extra.get("banned_places") or []
@@ -3181,9 +3256,9 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
     if rubric == "vocabulary_15":
         max_tok = 3200
     elif rubric == "photo_relax":
-        max_tok = 800
+        max_tok = 1000
     elif rubric == "interesting_cities":
-        max_tok = 1400
+        max_tok = 2200
     elif rubric == "travel_video_landmark":
         max_tok = 2200
     else:
@@ -3373,12 +3448,12 @@ def build_interesting_cities_signature(data: dict) -> str:
     city = str(data.get("city_name", "")).strip()
     country = str(data.get("country", "")).strip()
     hook = str(data.get("hook", "")).strip()
-    famous = data.get("famous_for") or []
-    sights = data.get("sights") or []
-    why = str(data.get("why_visit", "")).strip()
-    ff = " ".join(str(x).strip() for x in famous if str(x).strip())
-    ss = " ".join(str(x).strip() for x in sights if str(x).strip())
-    body = f"{hook} | {ff} | {ss} | {why}"
+    special = str(data.get("what_makes_it_special", "")).strip()
+    exp = data.get("experiences") or []
+    exp_s = " ".join(str(x).strip() for x in exp if str(x).strip())
+    note = str(data.get("personal_note", "")).strip()
+    closing = str(data.get("closing", "")).strip()
+    body = f"{hook} | {special} | {exp_s} | {note} | {closing}"
     return _normalize_text(f"{city}|{country}|{body}")[:400]
 
 
@@ -3399,40 +3474,45 @@ def validate_interesting_cities(
         pq = f"{city} {country} city travel landscape architecture"
     data["photo_query"] = pq
     hook = str(data.get("hook", "")).strip()
-    famous = data.get("famous_for")
-    sights = data.get("sights")
-    why_visit = str(data.get("why_visit", "")).strip()
+    what_special = str(data.get("what_makes_it_special", "")).strip()
+    experiences = data.get("experiences")
+    personal_note = str(data.get("personal_note", "")).strip()
+    closing = str(data.get("closing", "")).strip()
     if not hook:
         return False, "empty hook"
-    if not why_visit:
-        return False, "empty why_visit"
-    if not isinstance(famous, list) or not isinstance(sights, list):
-        return False, "famous_for and sights must be lists"
-    famous = [str(x).strip() for x in famous if str(x).strip()]
-    sights = [str(x).strip() for x in sights if str(x).strip()]
-    if not (1 <= len(famous) <= 2):
-        return False, "famous_for must have 1–2 items"
-    if len(sights) != 3:
-        return False, "sights must have exactly 3 items"
+    if not what_special:
+        return False, "empty what_makes_it_special"
+    if not personal_note:
+        return False, "empty personal_note"
+    if not closing:
+        return False, "empty closing"
+    if not isinstance(experiences, list):
+        return False, "experiences must be a list"
+    experiences = [str(x).strip() for x in experiences if str(x).strip()]
+    if not (2 <= len(experiences) <= 4):
+        return False, "experiences must have 2–4 items"
     cy = re.compile(r"[\u0400-\u04FF]")
-    if len(hook) > 240:
+    if len(hook) > 500:
         return False, "hook too long"
-    if len(why_visit) > 300:
-        return False, "why_visit too long"
-    for i, s in enumerate(famous):
-        if len(s) > 220:
-            return False, f"famous_for {i+1} too long"
+    if len(what_special) > 700:
+        return False, "what_makes_it_special too long"
+    if len(personal_note) > 400:
+        return False, "personal_note too long"
+    if len(closing) > 400:
+        return False, "closing too long"
+    for i, s in enumerate(experiences):
+        if len(s) > 450:
+            return False, f"experience {i+1} too long"
         if cy.search(s) or _has_emoji_or_flag(s):
-            return False, "famous_for: Cyrillic or emoji not allowed"
-    for i, s in enumerate(sights):
-        if len(s) > 160:
-            return False, f"sight {i+1} too long"
-        if cy.search(s) or _has_emoji_or_flag(s):
-            return False, "sights: Cyrillic or emoji not allowed"
+            return False, "experiences: Cyrillic or emoji not allowed"
+    if cy.search(what_special) or _has_emoji_or_flag(what_special):
+        return False, "what_makes_it_special: Cyrillic or emoji not allowed"
     if cy.search(hook) or _has_emoji_or_flag(hook):
         return False, "hook: Cyrillic or emoji not allowed"
-    if cy.search(why_visit) or _has_emoji_or_flag(why_visit):
-        return False, "why_visit: Cyrillic or emoji not allowed"
+    if cy.search(personal_note) or _has_emoji_or_flag(personal_note):
+        return False, "personal_note: Cyrillic or emoji not allowed"
+    if cy.search(closing) or _has_emoji_or_flag(closing):
+        return False, "closing: Cyrillic or emoji not allowed"
     if cy.search(city) or cy.search(country) or _has_emoji_or_flag(city) or _has_emoji_or_flag(country):
         return False, "city/country must be Latin letters only, no emoji"
 
@@ -3446,9 +3526,10 @@ def validate_interesting_cities(
             "city_name": city,
             "country": country,
             "hook": hook,
-            "famous_for": famous,
-            "sights": sights,
-            "why_visit": why_visit,
+            "what_makes_it_special": what_special,
+            "experiences": experiences,
+            "personal_note": personal_note,
+            "closing": closing,
         }
     )
     recent_norm = {_normalize_text(x) for x in recent_signatures if x}
@@ -3459,9 +3540,10 @@ def validate_interesting_cities(
     data["country"] = country
     data["photo_query"] = pq
     data["hook"] = hook
-    data["famous_for"] = famous
-    data["sights"] = sights
-    data["why_visit"] = why_visit
+    data["what_makes_it_special"] = what_special
+    data["experiences"] = experiences
+    data["personal_note"] = personal_note
+    data["closing"] = closing
     return True, "ok"
 
 
@@ -3663,12 +3745,26 @@ def build_quote_motivation(data: dict, photo_b64: str) -> str:
     return html_base(photo_b64, blocks)
 
 
+def vocabulary_15_heading_display(title: str) -> str:
+    """Заголовок без «15» — номери вже в списку."""
+    s = (title or "").strip()
+    if not s:
+        return s
+    s = re.sub(r"^15\s*[-–—:.]\s*", "", s)
+    s = re.sub(r"^15\s+", "", s)
+    s = re.sub(r"\s*[-–—]\s*15\s+words?\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def build_vocabulary_15(data: dict) -> str:
     """
     Кремова картка в стилі EnglishCardsGenerator.html + авто-підгін шрифту (JS),
     як fitTextInBox у генераторі: довгі слова/рядки зменшують базовий font-size, поки блок вміщується.
     """
-    title_en = _safe_html(str(data.get("theme_title", "Vocabulary")).strip())
+    raw_title = str(data.get("theme_title", "Vocabulary")).strip()
+    displayed = vocabulary_15_heading_display(raw_title)
+    title_en = _safe_html(displayed if displayed else (raw_title or "Vocabulary"))
     title_block = f'<p class="v15-heading"><strong>{title_en}</strong></p>'
 
     words = data.get("words", [])[:15]
@@ -4083,21 +4179,20 @@ def build_interesting_cities_caption(data: dict) -> str:
     city = str(data.get("city_name", "")).strip()
     country = str(data.get("country", "")).strip()
     hook = str(data.get("hook", "")).strip()
-    famous = data.get("famous_for") or []
-    sights = data.get("sights") or []
-    why = str(data.get("why_visit", "")).strip()
-    ff = [str(x).strip() for x in famous if str(x).strip()][:2]
-    ss = [str(x).strip() for x in sights if str(x).strip()][:3]
+    what_special = str(data.get("what_makes_it_special", "")).strip()
+    experiences = data.get("experiences") or []
+    exp = [str(x).strip() for x in experiences if str(x).strip()]
+    note = str(data.get("personal_note", "")).strip()
+    closing = str(data.get("closing", "")).strip()
     blocks: list[str] = [f"{city}, {country}", hook]
-    if ff:
-        blocks.append("\n".join(ff))
-    if len(ss) == 3:
-        blocks.append(
-            "What to see:\n"
-            + "\n".join(f"{i}. {s}" for i, s in enumerate(ss, 1))
-        )
-    if why:
-        blocks.append(why)
+    if what_special:
+        blocks.append(what_special)
+    if exp:
+        blocks.append("\n\n".join(exp))
+    if note:
+        blocks.append(note)
+    if closing:
+        blocks.append(closing)
     return "\n\n".join(blocks)
 
 
@@ -4281,7 +4376,10 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
         elif rubric == "photo_relax":
             extra = await pick_photo_relax_theme(history_mgr)
             photo_query = extra["photo_query"]
-            log.info(f"🌿 photo_relax visual_theme={extra.get('theme_id')} query='{photo_query}'")
+            log.info(
+                f"🌿 photo_relax visual_theme={extra.get('theme_id')} "
+                f"voice_style={extra.get('voice_style_id')} query='{photo_query}'"
+            )
 
         elif rubric == "interesting_cities":
             extra = {}
@@ -4471,6 +4569,7 @@ async def publish_image_card(rubric: str, redis_client: UpstashRedis):
                     await history_mgr.add_signature("vocabulary_15", sig)
             if rubric == "photo_relax":
                 await history_mgr.advance_photo_relax_theme_index()
+                await history_mgr.advance_photo_relax_voice_style_index()
                 ss = data.get("sentences") or []
                 if isinstance(ss, list) and len(ss) == 4:
                     await history_mgr.add_signature(
@@ -4654,7 +4753,7 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
   vocabulary_15        — 15 слів + IPA (кремова картка)
   daily_phrase         — фраза дня + приклад (en) + переклад (ua)
   situation_phrases    — 5 фраз (en/ua) для життєвої ситуації
-  photo_relax          — природа: чисте фото PNG; 4 речення (en, рівень A2) у caption під медіа
+  photo_relax          — природа: чисте фото PNG; 4 речення (en, «живий» п’ятничний релакс, ротація стилю голосу)
 
 Пн–Пт — квізи (Telegram poll):
   grammar_quiz           (11:30)
@@ -4663,7 +4762,7 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
   prepositions_quiz      (16:00)
 
 Сб 16:00 Europe/Kyiv — чисте фото PNG + текст у caption:
-  interesting_cities   — місто/країна, hook, факти, «What to see:» + 3 пункти, чому їхати (en A2)
+  interesting_cities   — фото + живий текст (англ.): гачок, що особливе, 2–4 досвіди, особиста нотка, завершення (без нумерованих списків)
 
 Нд 16:00 Europe/Kyiv — відео 9:16 (сток Pexels/Pixabay → Gemini A2 текст → ElevenLabs / Google TTS → FFmpeg + бренд 2–3 с), без підпису:
   travel_video
