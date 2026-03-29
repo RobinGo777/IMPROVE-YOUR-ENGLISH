@@ -4675,6 +4675,7 @@ async def publish_placeholder_rubric(rubric: str, redis_client: UpstashRedis) ->
 
 
 async def publish_card(rubric: str, redis_client: UpstashRedis):
+    """Ручний тест: GET /test/<rubric> (HealthHandler); для відео — GET /test/travel_video."""
     if rubric in PLACEHOLDER_RUBRICS:
         await publish_placeholder_rubric(rubric, redis_client)
     elif rubric in QUIZ_RUBRICS:
@@ -4690,6 +4691,7 @@ async def publish_card(rubric: str, redis_client: UpstashRedis):
 # ──────────────────────────────────────────────
 _redis_client_global: "UpstashRedis | None" = None
 
+# Усі рубрики, для яких дозволено ручний запуск HTTP (у т.ч. travel_video з WEEKEND_16_00).
 VALID_RUBRICS = sorted(
     set(WEEKDAY_10_00.values())
     | {r for _, r in QUIZ_SLOTS}
@@ -4702,6 +4704,7 @@ RUBRIC_HELP = "\n".join(f"  /test/{r}" for r in VALID_RUBRICS)
 TEST_ENDPOINTS_DOC = f"""English A2 Bot v2.0 — OK
 
 Manual test: GET /test/{{rubric}} — одноразово запускає публікацію (перевірте Telegram).
+  Приклад відео: GET /test/travel_video — той самий пайплайн, що й у неділю 16:00 (sendVideo без підпису).
 
 Пн–Пт 10:00 Europe/Kyiv — великі пости (PNG):
   quote_motivation     — цитата / мотивація + фото
