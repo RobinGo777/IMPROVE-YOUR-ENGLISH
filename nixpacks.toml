@@ -1,0 +1,3 @@
+# Якщо деплой з GitHub через Nixpacks (Railway тощо) без Docker — підтягуємо ffmpeg у образ
+[phases.setup]
+aptPkgs = ["ffmpeg"]
