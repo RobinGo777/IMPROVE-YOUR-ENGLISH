@@ -13,6 +13,9 @@ import time
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from io import BytesIO
+import shutil
+import subprocess
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -53,6 +56,10 @@ GEMINI_API_KEYS = [k for k in GEMINI_API_KEYS if k]  # прибираємо по
 UNSPLASH_ACCESS_KEY  = os.environ.get("UNSPLASH_ACCESS_KEY", "")
 PEXELS_API_KEY       = os.environ.get("PEXELS_API_KEY", "")
 PIXABAY_API_KEY      = os.environ.get("PIXABAY_API_KEY", "")
+ELEVENLABS_API_KEY   = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID  = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+# Google Cloud TTS: шлях до JSON service account (у контейнері — secret mount)
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
 # ──────────────────────────────────────────────
 # МОДЕЛІ
@@ -96,7 +103,21 @@ WEEKEND_16_00: dict[int, str] = {
     6: "travel_video",
 }
 
-PLACEHOLDER_RUBRICS = frozenset({"travel_video"})
+# Нд 16:00 — travel_video: сток-відео + Gemini + TTS + FFmpeg (9:16), без UNESCO
+TRAVEL_VIDEO_LANDMARK_CATEGORIES: list[str] = [
+    "Natural wonders",
+    "Historic & cultural sites",
+    "Urban & modern icons",
+    "Cultural & symbolic places",
+    "Tourist & resort destinations",
+    "Unique or extreme places",
+]
+TRAVEL_VIDEO_MAIN_MAX_SEC = 58.0
+TRAVEL_VIDEO_BRAND_SEC = 2.5
+TRAVEL_VIDEO_PIPELINE_ATTEMPTS = 3
+TRAVEL_VIDEO_NARRATION_WORDS_MAX = 160
+
+PLACEHOLDER_RUBRICS = frozenset()
 
 
 def get_rubric_for_datetime(now: datetime) -> str | None:
@@ -1246,6 +1267,21 @@ class HistoryManager:
         except Exception as e:
             log.error(f"❌ Redis advance_photo_relax_theme_index error: {e}")
 
+    async def get_travel_video_banned_places(self) -> list[str]:
+        try:
+            items = await self.r.lrange("used:travel_video_places", 0, 199)
+            return [str(x) for x in (items or []) if x]
+        except Exception as e:
+            log.error(f"❌ Redis get_travel_video_banned_places error: {e}")
+            return []
+
+    async def add_travel_video_place(self, place_key: str):
+        try:
+            await self.r.lpush("used:travel_video_places", place_key)
+            await self.r.ltrim("used:travel_video_places", 0, 299)
+        except Exception as e:
+            log.error(f"❌ Redis add_travel_video_place error: {e}")
+
     async def get_interesting_cities_banned(self) -> list[str]:
         try:
             items = await self.r.lrange("used:interesting_cities_places", 0, 99)
@@ -1589,6 +1625,845 @@ async def download_photo(url: str) -> bytes | None:
     except Exception as e:
         log.error(f"❌ Photo download exception: {e} url={url[:60]}")
         return None
+
+
+# ──────────────────────────────────────────────
+# TRAVEL VIDEO — сток, FFmpeg, TTS
+# ──────────────────────────────────────────────
+def _travel_video_place_key(landmark: str, country: str) -> str:
+    return _normalize_text(f"{landmark.strip()}|{country.strip()}")
+
+
+def ffprobe_duration_seconds(path: str) -> float:
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return 0.0
+        return float(r.stdout.strip())
+    except Exception as e:
+        log.warning(f"⚠️ ffprobe duration: {e}")
+        return 0.0
+
+
+def _run_ffmpeg(args: list[str]) -> bool:
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            log.error(f"❌ ffmpeg failed: {r.stderr[:800]}")
+            return False
+        return True
+    except Exception as e:
+        log.error(f"❌ ffmpeg exception: {e}")
+        return False
+
+
+async def download_video_bytes(url: str) -> bytes | None:
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(url, follow_redirects=True)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+            log.warning(f"⚠️ video download HTTP {resp.status_code}")
+            return None
+    except Exception as e:
+        log.error(f"❌ download_video_bytes: {e}")
+        return None
+
+
+def _pick_pexels_video_url(videos: list) -> str | None:
+    best = None
+    best_score = -1
+    for v in videos:
+        for vf in v.get("video_files") or []:
+            w = int(vf.get("width") or 0)
+            h = int(vf.get("height") or 0)
+            link = vf.get("link")
+            if not link:
+                continue
+            # Пріоритет: вертикаль близько 9:16
+            score = 0
+            if h >= w and h >= 720:
+                score = h + (2000 if 1.2 <= h / max(w, 1) <= 2.5 else 0)
+            else:
+                score = h // 2
+            if score > best_score:
+                best_score = score
+                best = link
+    return best
+
+
+async def fetch_pexels_videos(query: str) -> list[str]:
+    if not PEXELS_API_KEY:
+        return []
+    url = "https://api.pexels.com/videos/search"
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": query, "orientation": "portrait", "per_page": 15}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, params=params, headers=headers)
+            if resp.status_code != 200:
+                log.warning(f"⚠️ Pexels videos HTTP {resp.status_code}")
+                return []
+            data = resp.json()
+            out: list[str] = []
+            for v in data.get("videos") or []:
+                u = _pick_pexels_video_url([v])
+                if u:
+                    out.append(u)
+            return out
+    except Exception as e:
+        log.error(f"❌ fetch_pexels_videos: {e}")
+        return []
+
+
+async def fetch_pixabay_videos(query: str) -> list[str]:
+    if not PIXABAY_API_KEY:
+        return []
+    url = "https://pixabay.com/api/videos/"
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query,
+        "per_page": 15,
+        "safesearch": "true",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                log.warning(f"⚠️ Pixabay videos HTTP {resp.status_code}")
+                return []
+            data = resp.json()
+            out: list[str] = []
+            for hit in data.get("hits") or []:
+                vids = hit.get("videos") or {}
+                for key in ("large", "medium", "small", "tiny"):
+                    block = vids.get(key)
+                    if isinstance(block, dict) and block.get("url"):
+                        out.append(block["url"])
+                        break
+            return out
+    except Exception as e:
+        log.error(f"❌ fetch_pixabay_videos: {e}")
+        return []
+
+
+async def fetch_pixabay_music_url() -> str | None:
+    if not PIXABAY_API_KEY:
+        return None
+    url = "https://pixabay.com/api/audio/"
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": "calm ambient instrumental",
+        "per_page": 10,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            for hit in data.get("hits") or []:
+                au = hit.get("audioURL") or hit.get("previewURL") or hit.get("audio")
+                if au:
+                    return str(au)
+    except Exception as e:
+        log.warning(f"⚠️ fetch_pixabay_music_url: {e}")
+    return None
+
+
+def normalize_clip_to_vertical_9_16(src: str, dst: str, max_sec: float) -> bool:
+    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        src,
+        "-vf",
+        vf,
+        "-t",
+        str(max_sec),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "26",
+        "-an",
+        "-movflags",
+        "+faststart",
+        dst,
+    ]
+    return _run_ffmpeg(args)
+
+
+def concat_videos_ffmpeg(paths: list[str], out_path: str, max_total_sec: float) -> bool:
+    if not paths:
+        return False
+    if len(paths) == 1:
+        d = ffprobe_duration_seconds(paths[0])
+        if d <= max_total_sec:
+            shutil.copy(paths[0], out_path)
+            return True
+        return _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                paths[0],
+                "-t",
+                str(max_total_sec),
+                "-c",
+                "copy",
+                out_path,
+            ]
+        )
+    lst = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    try:
+        for p in paths:
+            lst.write(f"file '{os.path.abspath(p)}'\n")
+        lst.close()
+        tmp_concat = out_path + ".concat.mp4"
+        ok = _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                lst.name,
+                "-c",
+                "copy",
+                tmp_concat,
+            ]
+        )
+        if not ok:
+            return False
+        d = ffprobe_duration_seconds(tmp_concat)
+        if d > max_total_sec:
+            ok2 = _run_ffmpeg(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    tmp_concat,
+                    "-t",
+                    str(max_total_sec),
+                    "-c",
+                    "copy",
+                    out_path,
+                ]
+            )
+            try:
+                os.remove(tmp_concat)
+            except OSError:
+                pass
+            return ok2
+        shutil.move(tmp_concat, out_path)
+        return True
+    finally:
+        try:
+            os.remove(lst.name)
+        except OSError:
+            pass
+
+
+async def elevenlabs_tts_to_mp3(text: str, out_path: str) -> bool:
+    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+        return False
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    payload = {"text": text, "model_id": "eleven_multilingual_v2"}
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                log.warning(f"⚠️ ElevenLabs HTTP {resp.status_code}: {resp.text[:200]}")
+                return False
+            with open(out_path, "wb") as f:
+                f.write(resp.content)
+            return True
+    except Exception as e:
+        log.warning(f"⚠️ ElevenLabs TTS: {e}")
+        return False
+
+
+def google_tts_to_mp3(text: str, out_path: str) -> bool:
+    if not GOOGLE_APPLICATION_CREDENTIALS or not os.path.isfile(GOOGLE_APPLICATION_CREDENTIALS):
+        log.warning("⚠️ Google TTS: GOOGLE_APPLICATION_CREDENTIALS path missing or not a file")
+        return False
+    try:
+        from google.cloud import texttospeech
+    except ImportError:
+        log.error("❌ google-cloud-texttospeech not installed")
+        return False
+    try:
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-GB",
+            name="en-GB-Wavenet-B",
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.0,
+        )
+        resp = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        with open(out_path, "wb") as f:
+            f.write(resp.audio_content)
+        return True
+    except Exception as e:
+        log.warning(f"⚠️ Google TTS: {e}")
+        return False
+
+
+def mix_voice_and_music(voice_mp3: str, music_path: str | None, out_path: str) -> bool:
+    if not music_path or not os.path.isfile(music_path):
+        shutil.copy(voice_mp3, out_path)
+        return True
+    # Тиха музика; amix duration=first = довжина голосу
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        voice_mp3,
+        "-i",
+        music_path,
+        "-filter_complex",
+        "[1:a]volume=0.12[m];[0:a][m]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+        "-map",
+        "[aout]",
+        "-c:a",
+        "libmp3lame",
+        "-q:a",
+        "4",
+        out_path,
+    ]
+    return _run_ffmpeg(args)
+
+
+def mux_video_audio_pad(video_path: str, audio_path: str, out_path: str) -> bool:
+    vd = ffprobe_duration_seconds(video_path)
+    ad = ffprobe_duration_seconds(audio_path)
+    if vd <= 0 or ad <= 0:
+        return False
+    pad = max(0.0, vd - ad)
+    if pad <= 0.01:
+        return _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                out_path,
+            ]
+        )
+    return _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-filter_complex",
+            f"[1:a]apad=pad_dur={pad}[aout]",
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            out_path,
+        ]
+    )
+
+
+def final_encode_for_telegram(src_path: str, dst_path: str) -> bool:
+    """Агресивний бітрейт, H.264 + AAC, 9:16."""
+    return _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            src_path,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "28",
+            "-maxrate",
+            "2M",
+            "-bufsize",
+            "4M",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            dst_path,
+        ]
+    )
+
+
+def concat_two_videos(v1: str, v2: str, out_path: str) -> bool:
+    lst = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    try:
+        lst.write(f"file '{os.path.abspath(v1)}'\nfile '{os.path.abspath(v2)}'\n")
+        lst.close()
+        ok = _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                lst.name,
+                "-c",
+                "copy",
+                out_path,
+            ]
+        )
+        if ok:
+            return True
+        log.warning("⚠️ concat copy failed — re-encoding")
+        return _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                lst.name,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "26",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                out_path,
+            ]
+        )
+    finally:
+        try:
+            os.remove(lst.name)
+        except OSError:
+            pass
+
+
+BRANDING_ENDCARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,600&family=Montserrat:wght@300;500;600&display=swap" rel="stylesheet">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    width: 1080px;
+    height: 1920px;
+    background: #0a0a0a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Montserrat', sans-serif;
+  }}
+  .card {{
+    background: #1c1c1e;
+    border-radius: 28px;
+    padding: 72px 56px;
+    text-align: center;
+    margin: 0 48px;
+    position: relative;
+    overflow: hidden;
+  }}
+  .card::before {{
+    content: '';
+    position: absolute;
+    top: -40px; right: -40px;
+    width: 160px; height: 160px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(201,168,76,0.08) 0%, transparent 70%);
+  }}
+  .wordmark {{
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 56px;
+    font-weight: 300;
+    letter-spacing: 6px;
+    color: #f5f5f7;
+    line-height: 1.15;
+  }}
+  .wordmark span {{ color: #c9a84c; font-style: italic; }}
+  .divider {{
+    width: 120px;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, #c9a84c, transparent);
+    margin: 28px auto;
+  }}
+  .tagline {{
+    font-size: 11px;
+    letter-spacing: 8px;
+    text-transform: uppercase;
+    color: #8e8e93;
+    margin-top: 8px;
+  }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="wordmark">Improve<br>Your <span>English</span></div>
+    <div class="divider"></div>
+    <div class="tagline">Learn • Grow • Succeed</div>
+  </div>
+</body>
+</html>"""
+
+
+async def render_branding_png_bytes() -> bytes:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1080, "height": 1920})
+        await page.set_content(BRANDING_ENDCARD_HTML, wait_until="domcontentloaded")
+        await asyncio.sleep(1.2)
+        png = await page.screenshot(type="png")
+        await browser.close()
+        return png
+
+
+async def branding_clip_to_mp4(png_path: str, out_mp4: str, duration_sec: float) -> bool:
+    """Статичний кадр → коротке відео з тихим AAC (для concat з основним роликом)."""
+    args = [
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        png_path,
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-t",
+        str(duration_sec),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "26",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "48k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        out_mp4,
+    ]
+    return _run_ffmpeg(args)
+
+
+async def send_video_to_telegram(video_path: str, rubric: str) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                with open(video_path, "rb") as f:
+                    data = {"chat_id": TELEGRAM_CHAT_ID}
+                    resp = await client.post(
+                        url,
+                        data=data,
+                        files={"video": (f"{rubric}.mp4", f, "video/mp4")},
+                    )
+                log.info(f"📤 Telegram sendVideo attempt {attempt}: status={resp.status_code}")
+                if resp.status_code == 200:
+                    log.info(f"✅ Telegram: video sent [{rubric}]")
+                    return True
+                log.error(f"❌ sendVideo failed: {resp.status_code} — {resp.text[:400]}")
+        except Exception as e:
+            log.error(f"❌ sendVideo exception attempt {attempt}: {e}")
+        if attempt < 3:
+            await asyncio.sleep(5 * attempt)
+    return False
+
+
+def validate_travel_video_landmark_bundle(data: dict, banned: set[str]) -> tuple[bool, str]:
+    lm = str(data.get("landmark_name", "")).strip()
+    country = str(data.get("country", "")).strip()
+    cat = str(data.get("category", "")).strip()
+    stock_q = str(data.get("stock_query", "")).strip()
+    narr = str(data.get("narration", "")).strip()
+    if not lm or not country:
+        return False, "empty landmark or country"
+    if cat not in TRAVEL_VIDEO_LANDMARK_CATEGORIES:
+        return False, f"bad category: {cat}"
+    if not stock_q:
+        return False, "empty stock_query"
+    if not narr:
+        return False, "empty narration"
+    words = narr.split()
+    if len(words) < 40 or len(words) > TRAVEL_VIDEO_NARRATION_WORDS_MAX:
+        return False, f"narration word count {len(words)}"
+    pk = _travel_video_place_key(lm, country)
+    if pk in banned:
+        return False, "place banned"
+    cy = re.compile(r"[\u0400-\u04FF]")
+    if cy.search(narr) or cy.search(lm) or cy.search(country):
+        return False, "Cyrillic in fields"
+    return True, "ok"
+
+
+async def generate_travel_video_landmark_bundle(
+    history: list,
+    banned_places: list[str],
+    max_attempts: int = 3,
+) -> dict:
+    extra = {"banned_places": banned_places}
+    banned_norm = {_normalize_text(x) for x in banned_places if x}
+    hist = list(history)
+    last_reason = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        data = await generate_content("travel_video_landmark", hist, extra)
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        ok, reason = validate_travel_video_landmark_bundle(data, banned_norm)
+        if ok:
+            if attempt > 1:
+                log.info(f"✅ travel_video_landmark validated on retry #{attempt}")
+            return data
+        last_reason = reason
+        log.warning(
+            f"⚠️ travel_video_landmark reject attempt {attempt}/{max_attempts}: {reason}"
+        )
+        hist = hist + [f"reject:{reason}"]
+    raise RuntimeError(f"travel_video_landmark failed: {last_reason}")
+
+
+async def build_travel_video_main_from_stock(
+    stock_query: str,
+    landmark: str,
+    country: str,
+    tmpdir: str,
+) -> str | None:
+    """Повертає шлях до нормалізованого відео ≤ TRAVEL_VIDEO_MAIN_MAX_SEC."""
+    urls: list[str] = []
+    urls.extend(await fetch_pexels_videos(stock_query))
+    if not urls:
+        urls.extend(await fetch_pixabay_videos(stock_query))
+    if not urls:
+        q2 = f"{landmark} {country} landmark vertical"
+        urls.extend(await fetch_pexels_videos(q2))
+        urls.extend(await fetch_pixabay_videos(q2))
+    if not urls:
+        log.warning("⚠️ No stock video URLs")
+        return None
+
+    norm_paths: list[str] = []
+    total = 0.0
+    for i, u in enumerate(urls):
+        if total >= TRAVEL_VIDEO_MAIN_MAX_SEC:
+            break
+        raw = await download_video_bytes(u)
+        if not raw:
+            continue
+        raw_path = os.path.join(tmpdir, f"raw_{i}.mp4")
+        npath = os.path.join(tmpdir, f"norm_{i}.mp4")
+        with open(raw_path, "wb") as f:
+            f.write(raw)
+        if not normalize_clip_to_vertical_9_16(
+            raw_path, npath, TRAVEL_VIDEO_MAIN_MAX_SEC
+        ):
+            continue
+        d = ffprobe_duration_seconds(npath)
+        if d <= 0:
+            continue
+        norm_paths.append(npath)
+        total += d
+        if total >= TRAVEL_VIDEO_MAIN_MAX_SEC - 0.5:
+            break
+
+    if not norm_paths:
+        return None
+
+    out = os.path.join(tmpdir, "main_segment.mp4")
+    if not concat_videos_ffmpeg(norm_paths, out, TRAVEL_VIDEO_MAIN_MAX_SEC):
+        return None
+    return out
+
+
+async def publish_travel_video(rubric: str, redis_client: UpstashRedis):
+    history_mgr = HistoryManager(redis_client)
+    start_time = time.time()
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log.info(f"🎬 START travel_video [{rubric}] at {datetime.now().strftime('%H:%M:%S')}")
+
+    if not await history_mgr.acquire_lock(rubric):
+        log.warning(f"⚠️ Lock exists for [{rubric}] — skipping")
+        return
+
+    try:
+        banned = await history_mgr.get_travel_video_banned_places()
+        history = await history_mgr.get_used(rubric)
+
+        success = False
+        for cycle in range(1, TRAVEL_VIDEO_PIPELINE_ATTEMPTS + 1):
+            tmpdir = tempfile.mkdtemp(prefix="travel_vid_")
+            try:
+                log.info(f"🔄 travel_video pipeline cycle {cycle}/{TRAVEL_VIDEO_PIPELINE_ATTEMPTS}")
+                try:
+                    bundle = await generate_travel_video_landmark_bundle(
+                        history, banned, max_attempts=3
+                    )
+                except RuntimeError as e:
+                    log.warning(f"⚠️ [NF] travel_video Gemini bundle failed cycle {cycle}: {e}")
+                    continue
+
+                lm = str(bundle.get("landmark_name", "")).strip()
+                country = str(bundle.get("country", "")).strip()
+                stock_q = str(bundle.get("stock_query", "")).strip()
+                narr = str(bundle.get("narration", "")).strip()
+
+                main_seg = await build_travel_video_main_from_stock(
+                    stock_q, lm, country, tmpdir
+                )
+                if not main_seg:
+                    log.warning(f"⚠️ [NF] travel_video no stock video cycle {cycle}")
+                    continue
+
+                voice_mp3 = os.path.join(tmpdir, "voice.mp3")
+                tts_ok = await elevenlabs_tts_to_mp3(narr, voice_mp3)
+                if not tts_ok:
+                    tts_ok = google_tts_to_mp3(narr, voice_mp3)
+                if not tts_ok:
+                    log.warning(f"⚠️ [NF] travel_video TTS failed cycle {cycle}")
+                    continue
+
+                music_path = None
+                mu = await fetch_pixabay_music_url()
+                if mu:
+                    mb = await download_video_bytes(mu)
+                    if mb:
+                        music_path = os.path.join(tmpdir, "music.mp3")
+                        with open(music_path, "wb") as f:
+                            f.write(mb)
+
+                mixed_mp3 = os.path.join(tmpdir, "mixed.mp3")
+                if not mix_voice_and_music(voice_mp3, music_path, mixed_mp3):
+                    continue
+
+                muxed = os.path.join(tmpdir, "main_with_audio.mp4")
+                if not mux_video_audio_pad(main_seg, mixed_mp3, muxed):
+                    log.warning(f"⚠️ [NF] travel_video mux failed cycle {cycle}")
+                    continue
+
+                png_bytes = await render_branding_png_bytes()
+                brand_png = os.path.join(tmpdir, "brand.png")
+                with open(brand_png, "wb") as f:
+                    f.write(png_bytes)
+                brand_mp4 = os.path.join(tmpdir, "brand.mp4")
+                if not await branding_clip_to_mp4(
+                    brand_png, brand_mp4, TRAVEL_VIDEO_BRAND_SEC
+                ):
+                    log.warning(f"⚠️ [NF] travel_video brand clip failed cycle {cycle}")
+                    continue
+
+                pre_final = os.path.join(tmpdir, "pre_final.mp4")
+                if not concat_two_videos(muxed, brand_mp4, pre_final):
+                    log.warning(f"⚠️ [NF] travel_video final concat failed cycle {cycle}")
+                    continue
+
+                final_path = os.path.join(tmpdir, "final_telegram.mp4")
+                if not final_encode_for_telegram(pre_final, final_path):
+                    log.warning(f"⚠️ [NF] travel_video final encode failed cycle {cycle}")
+                    continue
+
+                sz_mb = os.path.getsize(final_path) / (1024 * 1024)
+                log.info(f"📦 travel_video final size: {sz_mb:.2f} MB")
+                if sz_mb > 48:
+                    log.warning("⚠️ [NF] travel_video file large for Telegram — trying anyway")
+
+                success = await send_video_to_telegram(final_path, rubric)
+                if success:
+                    pk = _travel_video_place_key(lm, country)
+                    if pk:
+                        await history_mgr.add_travel_video_place(pk)
+                    await history_mgr.add_used(
+                        rubric, json.dumps(bundle, ensure_ascii=False)[:120]
+                    )
+                    log.info(
+                        f"📣 [NF] travel_video published | {lm} | {country} | cycle={cycle}"
+                    )
+                    break
+            finally:
+                try:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                except Exception as e:
+                    log.warning(f"⚠️ tmpdir cleanup: {e}")
+
+        if not success:
+            log.error(
+                f"❌ [NF] travel_video SKIPPED after {TRAVEL_VIDEO_PIPELINE_ATTEMPTS} cycles — check logs above"
+            )
+
+        elapsed = time.time() - start_time
+        log.info(f"⏱️ [{rubric}] completed in {elapsed:.1f}s | success={success}")
+
+    except Exception as e:
+        log.error(f"❌ CRITICAL ERROR in travel_video: {e}", exc_info=True)
+    finally:
+        await history_mgr.release_lock(rubric)
+
 
 # ──────────────────────────────────────────────
 # МОВНИЙ ЦЕНЗОР — СИСТЕМНИЙ ПРОМПТ
@@ -1949,6 +2824,34 @@ Rules:
 - "photo_query": keywords that would find a strong cityscape/architecture/street photo of THAT city (Unsplash/Pexels/Pixabay).
 - Do not repeat cities from the banned list above."""
 
+    if rubric == "travel_video_landmark":
+        banned = extra.get("banned_places") or []
+        banned_note = ""
+        if banned:
+            banned_note = (
+                f"\nDo NOT choose any landmark+country pair from this list "
+                f"(same place even if spelling varies): {banned[-60:]}\n"
+            )
+        cats = ", ".join(TRAVEL_VIDEO_LANDMARK_CATEGORIES)
+        return f"""You are an English teacher. Pick ONE famous real-world landmark (a building, bridge, mountain, waterfall, temple, etc.) — NOT a whole city, NOT a vague region.
+{banned_note}{history_note}
+Allowed categories (pick exactly one for "category" — must match one string exactly):
+{cats}
+Do NOT use UNESCO as a category label. Do not focus the text on UNESCO listing; just describe the place for learners.
+Return ONLY valid JSON, no markdown, no extra text:
+{{
+  "landmark_name": "English name of the landmark",
+  "country": "English name of the country",
+  "category": "one of the allowed category strings above (exact match)",
+  "stock_query": "English keywords for stock VIDEO search (landmark + country + vertical/portrait; no quotes)",
+  "narration": "Full English voiceover script for A2 learners: about 5–8 short sentences, 70–{TRAVEL_VIDEO_NARRATION_WORDS_MAX} words total, present simple mostly, simple vocabulary, British English style, no lists, no stage directions, no quotes, no emojis."
+}}
+Rules:
+- English ONLY in all fields.
+- "narration" is spoken English only — no Ukrainian, no Russian.
+- Be factually plausible; do not invent dangerous or offensive content.
+- Vary continents and landmark types over time when possible."""
+
     raise ValueError(f"Unknown rubric: {rubric}")
 
 # ──────────────────────────────────────────────
@@ -2281,6 +3184,8 @@ async def generate_content(rubric: str, history: list, extra: dict = None) -> di
         max_tok = 800
     elif rubric == "interesting_cities":
         max_tok = 1400
+    elif rubric == "travel_video_landmark":
+        max_tok = 2200
     else:
         max_tok = 1000
     for model in GEMINI_MODELS:
@@ -3720,6 +4625,8 @@ async def publish_card(rubric: str, redis_client: UpstashRedis):
         await publish_placeholder_rubric(rubric, redis_client)
     elif rubric in QUIZ_RUBRICS:
         await publish_quiz(rubric, redis_client)
+    elif rubric == "travel_video":
+        await publish_travel_video(rubric, redis_client)
     else:
         await publish_image_card(rubric, redis_client)
 
@@ -3758,7 +4665,7 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
 Сб 16:00 Europe/Kyiv — чисте фото PNG + текст у caption:
   interesting_cities   — місто/країна, hook, факти, «What to see:» + 3 пункти, чому їхати (en A2)
 
-Нд 16:00 — заплановано доробити (зараз заглушка, пост не генерується):
+Нд 16:00 Europe/Kyiv — відео 9:16 (сток Pexels/Pixabay → Gemini A2 текст → ElevenLabs / Google TTS → FFmpeg + бренд 2–3 с), без підпису:
   travel_video
 
 Повний список шляхів для копіювання:
@@ -3865,6 +4772,7 @@ async def main():
         f"quizzes {QUIZ_SLOTS}, weekend {WEEKEND_16_00}"
     )
     log.info(f"🖼️ Image rubrics: {IMAGE_RUBRICS}")
+    log.info("🎬 travel_video: окремий відео-пайплайн (неділя 16:00)")
     log.info(f"📝 Quiz rubrics: {QUIZ_RUBRICS}")
     log.info("🧪 HTTP: GET / — опис усіх тестових рубрик; GET /test/<rubric> — ручний запуск")
 
