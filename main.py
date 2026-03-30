@@ -2247,16 +2247,33 @@ def mux_video_audio_pad(video_path: str, audio_path: str, out_path: str) -> bool
     )
 
 
-def final_encode_for_telegram(src_path: str, dst_path: str) -> bool:
-    """Агресивний бітрейт, H.264 + AAC, 9:16."""
-    return _run_ffmpeg(
+def final_encode_for_telegram(
+    src_path: str, dst_path: str, watermark_png: str | None = None
+) -> bool:
+    """Фінальний H.264 + AAC з опційним watermark у правому нижньому куті."""
+    args = [
+        FFMPEG_BIN,
+        "-y",
+        "-threads",
+        "1",
+        "-i",
+        src_path,
+    ]
+    if watermark_png and os.path.isfile(watermark_png):
+        args.extend(
+            [
+                "-i",
+                watermark_png,
+                "-filter_complex",
+                "[0:v][1:v]overlay=W-w-32:H-h-32:format=auto[v]",
+                "-map",
+                "[v]",
+                "-map",
+                "0:a?",
+            ]
+        )
+    args.extend(
         [
-            FFMPEG_BIN,
-            "-y",
-            "-threads",
-            "1",
-            "-i",
-            src_path,
             "-c:v",
             "libx264",
             "-preset",
@@ -2276,6 +2293,7 @@ def final_encode_for_telegram(src_path: str, dst_path: str) -> bool:
             dst_path,
         ]
     )
+    return _run_ffmpeg(args)
 
 
 def concat_two_videos(v1: str, v2: str, out_path: str) -> bool:
@@ -2404,6 +2422,49 @@ async def render_branding_png_bytes() -> bytes:
         await page.set_content(BRANDING_ENDCARD_HTML, wait_until="domcontentloaded")
         await asyncio.sleep(1.2)
         png = await page.screenshot(type="png")
+        await browser.close()
+        return png
+
+
+async def render_quote_brand_watermark_png_bytes() -> bytes:
+    """Логотип у стилі quote_motivation для накладання на відео."""
+    html = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 760px;
+    height: 120px;
+    background: transparent;
+    font-family: 'Montserrat', Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 6px;
+  }
+  .brand {
+    font-size: 36px;
+    font-weight: 300;
+    letter-spacing: 2px;
+    color: rgba(245,245,247,0.75);
+    text-shadow: 0 2px 8px rgba(0,0,0,0.85);
+  }
+  .eng { color: #c9a84c; }
+</style>
+</head>
+<body>
+  <span class="brand">Improve Your <span class="eng">English</span></span>
+</body>
+</html>"""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 760, "height": 120})
+        await page.set_content(html, wait_until="domcontentloaded")
+        await asyncio.sleep(0.6)
+        png = await page.screenshot(type="png", omit_background=True)
         await browser.close()
         return png
 
@@ -2703,24 +2764,17 @@ async def publish_travel_video(rubric: str, redis_client: UpstashRedis):
                     log.warning(f"⚠️ [NF] travel_video mux failed cycle {cycle}")
                     continue
 
-                png_bytes = await render_branding_png_bytes()
-                brand_png = os.path.join(tmpdir, "brand.png")
-                with open(brand_png, "wb") as f:
-                    f.write(png_bytes)
-                brand_mp4 = os.path.join(tmpdir, "brand.mp4")
-                if not await branding_clip_to_mp4(
-                    brand_png, brand_mp4, TRAVEL_VIDEO_BRAND_SEC
-                ):
-                    log.warning(f"⚠️ [NF] travel_video brand clip failed cycle {cycle}")
-                    continue
-
-                pre_final = os.path.join(tmpdir, "pre_final.mp4")
-                if not concat_two_videos(muxed, brand_mp4, pre_final):
-                    log.warning(f"⚠️ [NF] travel_video final concat failed cycle {cycle}")
-                    continue
-
                 final_path = os.path.join(tmpdir, "final_telegram.mp4")
-                if not final_encode_for_telegram(pre_final, final_path):
+                wm_png = os.path.join(tmpdir, "brand_wm.png")
+                try:
+                    wm_bytes = await render_quote_brand_watermark_png_bytes()
+                    with open(wm_png, "wb") as f:
+                        f.write(wm_bytes)
+                except Exception as e:
+                    wm_png = None
+                    log.warning(f"⚠️ [NF] travel_video watermark render failed cycle {cycle}: {e}")
+
+                if not final_encode_for_telegram(muxed, final_path, wm_png):
                     log.warning(f"⚠️ [NF] travel_video final encode failed cycle {cycle}")
                     continue
 
