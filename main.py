@@ -183,12 +183,14 @@ TRAVEL_VIDEO_LANDMARK_CATEGORIES: list[str] = [
     "Tourist & resort destinations",
     "Unique or extreme places",
 ]
-TRAVEL_VIDEO_MAIN_MAX_SEC = 58.0
+TRAVEL_VIDEO_MAIN_MAX_SEC = 34.0
 TRAVEL_VIDEO_BRAND_SEC = 2.5
 TRAVEL_VIDEO_PIPELINE_ATTEMPTS = 3
 # Pexels часто дає 4K — декод + буфери дають OOM на малих контейнерах; беремо ≤ цієї довгої сторони, якщо є
 TRAVEL_VIDEO_PEXELS_MAX_LONG_EDGE = 1920
 TRAVEL_VIDEO_NARRATION_WORDS_MAX = 160
+TRAVEL_VIDEO_SINGLE_CLIP_MIN_SEC = 24.0
+TRAVEL_VIDEO_SINGLE_CLIP_MAX_SEC = 42.0
 
 INTERESTING_CITIES_SENTENCES_MIN = 3
 INTERESTING_CITIES_SENTENCES_MAX = 5
@@ -1962,21 +1964,22 @@ async def fetch_pixabay_music_url() -> str | None:
     if not PIXABAY_API_KEY:
         return None
     url = "https://pixabay.com/api/audio/"
-    params = {
-        "key": PIXABAY_API_KEY,
-        "q": "calm ambient instrumental",
-        "per_page": 10,
-    }
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(url, params=params)
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            for hit in data.get("hits") or []:
-                au = hit.get("audioURL") or hit.get("previewURL") or hit.get("audio")
-                if au:
-                    return str(au)
+            for q in ("calm ambient instrumental", "ambient instrumental", "cinematic ambient"):
+                params = {
+                    "key": PIXABAY_API_KEY,
+                    "q": q,
+                    "per_page": 10,
+                }
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                for hit in data.get("hits") or []:
+                    au = hit.get("audioURL") or hit.get("previewURL") or hit.get("audio")
+                    if au:
+                        return str(au)
     except Exception as e:
         log.warning(f"⚠️ fetch_pixabay_music_url: {e}")
     return None
@@ -2001,9 +2004,9 @@ def normalize_clip_to_vertical_9_16(src: str, dst: str, max_sec: float) -> bool:
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        "veryfast",
         "-crf",
-        "30",
+        "27",
         "-an",
         "-movflags",
         "+faststart",
@@ -2172,6 +2175,26 @@ def mux_video_audio_pad(video_path: str, audio_path: str, out_path: str) -> bool
     ad = ffprobe_duration_seconds(audio_path)
     if vd <= 0 or ad <= 0:
         return False
+    # Якщо voice/music помітно коротші за відео, прибираємо довгу "німу" частину в кінці.
+    if vd - ad > 4.0:
+        trimmed = out_path + ".trim.mp4"
+        target = max(12.0, min(vd, ad + 2.0))
+        trimmed_ok = _run_ffmpeg(
+            [
+                FFMPEG_BIN,
+                "-y",
+                "-i",
+                video_path,
+                "-t",
+                f"{target:.2f}",
+                "-c",
+                "copy",
+                trimmed,
+            ]
+        )
+        if trimmed_ok:
+            video_path = trimmed
+            vd = target
     pad = max(0.0, vd - ad)
     if pad <= 0.01:
         return _run_ffmpeg(
@@ -2234,9 +2257,9 @@ def final_encode_for_telegram(src_path: str, dst_path: str) -> bool:
             "-c:v",
             "libx264",
             "-preset",
-            "ultrafast",
+            "veryfast",
             "-crf",
-            "30",
+            "27",
             "-maxrate",
             "2M",
             "-bufsize",
@@ -2309,7 +2332,6 @@ BRANDING_ENDCARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,600&family=Montserrat:wght@300;500;600&display=swap" rel="stylesheet">
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -2319,7 +2341,7 @@ BRANDING_ENDCARD_HTML = """<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: 'Montserrat', sans-serif;
+    font-family: Arial, Helvetica, sans-serif;
   }}
   .card {{
     background: #1c1c1e;
@@ -2339,7 +2361,7 @@ BRANDING_ENDCARD_HTML = """<!DOCTYPE html>
     background: radial-gradient(circle, rgba(201,168,76,0.08) 0%, transparent 70%);
   }}
   .wordmark {{
-    font-family: 'Cormorant Garamond', serif;
+    font-family: Georgia, "Times New Roman", serif;
     font-size: 56px;
     font-weight: 300;
     letter-spacing: 6px;
@@ -2403,9 +2425,9 @@ async def branding_clip_to_mp4(png_path: str, out_mp4: str, duration_sec: float)
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        "veryfast",
         "-crf",
-        "30",
+        "26",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -2517,6 +2539,8 @@ async def build_travel_video_main_from_stock(
 
     norm_paths: list[str] = []
     total = 0.0
+    # Пріоритет: один "готовий" кліп ~пів хвилини, щоб уникнути склейки та пришвидшити рендер.
+    best_single: tuple[str, float] | None = None
     for i, u in enumerate(urls):
         if total >= TRAVEL_VIDEO_MAIN_MAX_SEC:
             break
@@ -2524,6 +2548,7 @@ async def build_travel_video_main_from_stock(
         npath = os.path.join(tmpdir, f"norm_{i}.mp4")
         if not await download_url_to_file(u, raw_path):
             continue
+        raw_d = ffprobe_duration_seconds(raw_path)
         if not normalize_clip_to_vertical_9_16(
             raw_path, npath, TRAVEL_VIDEO_MAIN_MAX_SEC
         ):
@@ -2531,10 +2556,34 @@ async def build_travel_video_main_from_stock(
         d = ffprobe_duration_seconds(npath)
         if d <= 0:
             continue
+        if TRAVEL_VIDEO_SINGLE_CLIP_MIN_SEC <= raw_d <= TRAVEL_VIDEO_SINGLE_CLIP_MAX_SEC:
+            # Найкраще беремо найближчий до цілі основного ролика.
+            score = abs(raw_d - TRAVEL_VIDEO_MAIN_MAX_SEC)
+            if best_single is None or score < abs(best_single[1] - TRAVEL_VIDEO_MAIN_MAX_SEC):
+                best_single = (npath, raw_d)
+                if score <= 2.0:
+                    break
         norm_paths.append(npath)
         total += d
         if total >= TRAVEL_VIDEO_MAIN_MAX_SEC - 0.5:
             break
+
+    if best_single:
+        out = os.path.join(tmpdir, "main_segment.mp4")
+        if _run_ffmpeg(
+            [
+                FFMPEG_BIN,
+                "-y",
+                "-i",
+                best_single[0],
+                "-t",
+                str(TRAVEL_VIDEO_MAIN_MAX_SEC),
+                "-c",
+                "copy",
+                out,
+            ]
+        ):
+            return out
 
     if not norm_paths:
         return None
