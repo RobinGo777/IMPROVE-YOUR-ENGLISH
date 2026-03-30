@@ -2484,7 +2484,7 @@ def validate_travel_video_landmark_bundle(data: dict, banned: set[str]) -> tuple
     if pk in banned:
         return False, "place banned"
     cy = re.compile(r"[\u0400-\u04FF]")
-    if cy.search(narr) or cy.search(lm) or cy.search(country):
+    if cy.search(lm) or cy.search(country) or cy.search(stock_q):
         return False, "Cyrillic in fields"
     return True, "ok"
 
