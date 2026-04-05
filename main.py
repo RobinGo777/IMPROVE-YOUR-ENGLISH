@@ -3690,6 +3690,7 @@ Rules:
         category_desc  = extra.get("category_desc", "English word meanings")
         return f"""You are an English teacher creating a short quiz card for social media video.
 Category (MANDATORY): {category_label} — {category_desc}
+Target level: A2 (elementary — clear, simple, everyday English)
 {history_note}
 Return ONLY valid JSON, no markdown, no extra text:
 {{
@@ -3699,13 +3700,15 @@ Return ONLY valid JSON, no markdown, no extra text:
 }}
 Rules:
 - Category is {category_id} — question MUST match this category
-- Question max 80 characters — must be punchy and clear
-- Options: exactly 4, English only, max 40 chars each
-- Options must be plausible — wrong answers should be tempting, not obviously wrong
+- A2 level: use only simple, everyday vocabulary (CEFR A2 word list)
+- Question max 80 characters — punchy and clear
+- Options: exactly 4, English only, max 35 chars each, simple words
+- Wrong answers must be plausible but clearly different for A2 students
 - correct_index is 0-based (0=A, 1=B, 2=C, 3=D)
-- For vocabulary questions: use 'What does «Word» mean?' format with the word in guillemets
-- For grammar: show a sentence with a blank ___
-- Keep A2-B1 difficulty — not too easy, not too hard
+- For vocabulary questions: use 'What does «Word» mean?' — choose common A2 words
+  (resilient, grateful, exhausted, furious, cozy, awkward, stubborn, curious…)
+- For grammar: short sentence with a blank ___, simple tense (Present Simple, Past Simple, going to)
+- Shuffle the correct answer position — don't always put it at index 0
 - No Ukrainian text in JSON — all English"""
 
     raise ValueError(f"Unknown rubric: {rubric}")
@@ -5517,7 +5520,7 @@ def build_quiz_video_html(question: str, options: list, theme: str) -> str:
     answers_html = ""
     for i, (letter, opt) in enumerate(zip(letters, options[:4])):
         opt_safe = _safe_html(opt)
-        delay = 0.6 + i * 0.25  # pop-effect delay per answer
+        delay = 0.55 + i * 0.22  # slide-in delay per answer: A=0.55s B=0.77s C=0.99s D=1.21s
         answers_html += f"""
         <div class="answer-btn" style="animation-delay:{delay:.2f}s">
           <div class="answer-letter">{letter}</div>
@@ -5651,8 +5654,8 @@ def build_quiz_video_html(question: str, options: list, theme: str) -> str:
     box-shadow: 0 8px 40px rgba(0,0,0,0.25);
     flex-shrink: 0;
     opacity: 0;
-    transform: scale(0.7);
-    animation: popIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.15s forwards;
+    transform: translateX(110%);
+    animation: slideInRight 0.45s cubic-bezier(0.22,1,0.36,1) 0.10s forwards;
   }}
   .question-block::before {{
     content: '';
@@ -5696,8 +5699,8 @@ def build_quiz_video_html(question: str, options: list, theme: str) -> str:
     border: 3px solid rgba(255,255,255,0.13);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.07);
     opacity: 0;
-    transform: scale(0.5);
-    animation: popIn 0.45s cubic-bezier(0.34,1.56,0.64,1) forwards;
+    transform: translateX(110%);
+    animation: slideInRight 0.40s cubic-bezier(0.22,1,0.36,1) forwards;
   }}
 
   .answer-letter {{
@@ -5735,8 +5738,8 @@ def build_quiz_video_html(question: str, options: list, theme: str) -> str:
     overflow: hidden;
     flex-shrink: 0;
     opacity: 0;
-    transform: scale(0.7);
-    animation: popIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 1.6s forwards;
+    transform: translateX(-110%);
+    animation: slideInLeft 0.45s cubic-bezier(0.22,1,0.36,1) 1.55s forwards;
   }}
   .cta-block::before {{
     content: '';
@@ -5768,16 +5771,20 @@ def build_quiz_video_html(question: str, options: list, theme: str) -> str:
     justify-content: flex-end;
     flex-shrink: 0;
     opacity: 0;
-    animation: fadeIn 0.4s ease 1.9s forwards;
+    animation: fadeIn 0.35s ease 1.9s forwards;
   }}
   .footer-dots {{ display: flex; gap: 14px; }}
   .footer-dot  {{ width: 14px; height: 14px; border-radius: 50%; background: rgba(255,255,255,0.12); }}
   .footer-dot:nth-child(2) {{ background: var(--accent); opacity: 0.5; }}
 
   /* Animations */
-  @keyframes popIn {{
-    from {{ opacity: 0; transform: scale(0.5); }}
-    to   {{ opacity: 1; transform: scale(1); }}
+  @keyframes slideInRight {{
+    from {{ opacity: 0; transform: translateX(110%); }}
+    to   {{ opacity: 1; transform: translateX(0); }}
+  }}
+  @keyframes slideInLeft {{
+    from {{ opacity: 0; transform: translateX(-110%); }}
+    to   {{ opacity: 1; transform: translateX(0); }}
   }}
   @keyframes fadeIn {{
     from {{ opacity: 0; }}
@@ -5852,15 +5859,22 @@ async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
 
     # Ключові моменти: (time_ms, duration_sec_for_this_segment, label)
     # duration — скільки секунд цей кадр "тримається" у відео
+    # Таймінги відповідають CSS animation-delay:
+    #   question  → slideInRight delay=0.10s → видно ~0.55s
+    #   answer A  → slideInRight delay=0.55s → видно ~0.95s
+    #   answer B  → slideInRight delay=0.77s → видно ~1.17s
+    #   answer C  → slideInRight delay=0.99s → видно ~1.39s
+    #   answer D  → slideInRight delay=1.21s → видно ~1.61s
+    #   CTA       → slideInLeft  delay=1.55s → видно ~2.00s
     KEYFRAMES: list[tuple[float, float, str]] = [
-        (0,     0.20,  "k00_blank"),
-        (200,   0.45,  "k01_question"),
-        (650,   0.25,  "k02_ansA"),
-        (900,   0.25,  "k03_ansB"),
-        (1150,  0.25,  "k04_ansC"),
-        (1400,  0.30,  "k05_ansD"),
-        (1700,  0.50,  "k06_cta"),
-        (2200,  7.30,  "k07_full_static"),
+        (0,     0.15,  "k00_blank"),
+        (150,   0.40,  "k01_question"),
+        (590,   0.22,  "k02_ansA"),
+        (810,   0.22,  "k03_ansB"),
+        (1030,  0.22,  "k04_ansC"),
+        (1250,  0.34,  "k05_ansD"),
+        (1610,  0.40,  "k06_cta"),
+        (2050,  7.45,  "k07_full_static"),
         (9500,  2.50,  "k08_pause"),
     ]
     # Перевірка суми тривалостей
@@ -5942,25 +5956,52 @@ async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
 
     log.info(f"✅ quiz_video raw video built: {os.path.getsize(raw_video) / 1024:.0f} KB")
 
-    # 4. Генеруємо ambient-музику (окремий ffmpeg, легкий)
+    # 4. Генеруємо приємну ambient-мелодію (акорди C major + м'який envelope)
     audio_path = os.path.join(tmpdir, "ambient.aac")
-    # Простий ambient: два синуси + ехо + fade in/out
+    # Акорди C major pentatonic: C4=261.6 E4=329.6 G4=392.0 A4=440.0
+    # Кожен тон проходить через lowpass (знімає різкість) + м'який envelope
+    # Результат: тепла "quiz show" підкладка
     cmd_audio = [
         FFMPEG_BIN, "-y",
         "-f", "lavfi",
-        "-i", f"sine=frequency=80:duration={TOTAL_SEC}",
-        "-f", "lavfi",
-        "-i", f"sine=frequency=200:duration={TOTAL_SEC}",
-        "-filter_complex",
-        (
-            "[0][1]amix=inputs=2:duration=first[mix];"
-            "[mix]aecho=0.8:0.88:60:0.3[echo];"
-            f"[echo]afade=t=in:st=0:d=1,afade=t=out:st={TOTAL_SEC - 1.5}:d=1.5[out];"
-            "[out]volume=0.15[final]"
-        ),
+        "-i", (
+            # Базовий бас (C3 = 130.8 Hz) — м'який фундамент
+            "aevalsrc=0.18*sin(2*PI*130.8*t)*exp(-0.12*t)*"
+            "(0.5+0.5*sin(2*PI*0.5*t)):s=44100:d={dur}[bass];"
+
+            # Акорд 1: C4+E4+G4 — з'являється відразу (теплий мажор)
+            "aevalsrc=0.13*sin(2*PI*261.6*t)+0.10*sin(2*PI*329.6*t)+"
+            "0.08*sin(2*PI*392.0*t):s=44100:d={dur}[ch1];"
+
+            # Акорд 2: A4+C5+E5 — входить через 2с (Am додає інтерес)
+            "aevalsrc=if(gte(t,2.0),0.09*sin(2*PI*440.0*(t-2.0))+"
+            "0.07*sin(2*PI*523.2*(t-2.0))+0.06*sin(2*PI*659.2*(t-2.0)),0)"
+            ":s=44100:d={dur}[ch2];"
+
+            # Мелодична лінія: короткі ноти C5→E5→G5 з 4с
+            "aevalsrc=if(gte(t,4.0),"
+            "0.06*sin(2*PI*523.2*t)*exp(-1.5*(t-4.0))*step(t-4.0)"
+            "+0.06*sin(2*PI*659.2*t)*exp(-1.5*(t-5.2))*step(t-5.2)"
+            "+0.06*sin(2*PI*784.0*t)*exp(-1.5*(t-6.4))*step(t-6.4)"
+            ",0):s=44100:d={dur}[mel];"
+
+            # Мікс усіх шарів
+            "[bass][ch1][ch2][mel]amix=inputs=4:duration=first[mix];"
+
+            # Lowpass 1800 Hz — прибирає різкість синусів
+            "[mix]lowpass=f=1800[lp];"
+
+            # Легкий реверб — простір
+            "[lp]aecho=0.7:0.6:80:0.25[rev];"
+
+            # Fade in 0.8s / fade out 2s + гучність
+            "[rev]afade=t=in:st=0:d=0.8,"
+            "afade=t=out:st={fade_out}:d=2.0[out];"
+            "[out]volume=0.22[final]"
+        ).format(dur=TOTAL_SEC, fade_out=TOTAL_SEC - 2.2),
         "-map", "[final]",
         "-c:a", "aac",
-        "-b:a", "96k",
+        "-b:a", "128k",
         audio_path,
     ]
     audio_ok = _run_ffmpeg(cmd_audio)
