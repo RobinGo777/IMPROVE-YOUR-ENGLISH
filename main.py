@@ -271,6 +271,11 @@ def get_rubric_for_datetime(now: datetime) -> str | None:
     wd = now.weekday()
     h, m = now.hour, now.minute
 
+    # quiz_video щодня о 18:00 і 20:00
+    for (hh, mm) in QUIZ_VIDEO_SLOTS:
+        if (h, m) == (hh, mm):
+            return VIDEO_QUIZ_RUBRIC
+
     if wd <= 4:
         if (h, m) == (10, 0):
             return WEEKDAY_10_00[wd]
@@ -293,6 +298,30 @@ IMAGE_RUBRICS = {
     "photo_relax",
     "interesting_cities",
 }
+VIDEO_QUIZ_RUBRIC = "quiz_video"
+
+# Розклад quiz_video: щодня 18:00 і 20:00 Europe/Kyiv
+QUIZ_VIDEO_SLOTS: list[tuple[int, int]] = [(18, 0), (20, 0)]
+
+# Теми для quiz_video — ротація категорій
+QUIZ_VIDEO_CATEGORIES = [
+    {"id": "vocabulary",      "label": "Vocabulary",       "desc": "English word meaning, synonyms, definitions"},
+    {"id": "phrasal_verbs",   "label": "Phrasal Verbs",    "desc": "Meaning of common phrasal verbs in context"},
+    {"id": "grammar",         "label": "Grammar",          "desc": "Correct grammar form in a sentence"},
+    {"id": "false_friends",   "label": "False Friends",    "desc": "Words that look similar to Ukrainian but mean something else"},
+    {"id": "idioms",          "label": "Idioms",           "desc": "Meaning of English idioms and set phrases"},
+    {"id": "confusing_words", "label": "Confusing Words",  "desc": "Choose correct word: borrow/lend, make/do, say/tell"},
+    {"id": "collocations",    "label": "Collocations",     "desc": "Natural word combinations in English"},
+    {"id": "british_american","label": "British vs American", "desc": "Differences between British and American English"},
+    {"id": "prepositions",    "label": "Prepositions",     "desc": "Correct preposition in time/place/phrase context"},
+    {"id": "word_formation",  "label": "Word Formation",   "desc": "Prefixes, suffixes, derived forms of words"},
+]
+
+# Кольорові теми для quiz_video — рандомна щоразу
+QUIZ_VIDEO_THEMES = [
+    "ember", "meadow", "midnight", "blossom", "lavender",
+    "tangerine", "mint", "ocean", "cherry", "amber", "forest",
+]
 
 # photo_relax: ротація тем пошуку фото + контекст для Gemini (без дощу/вечора як орієнтирів)
 PHOTO_RELAX_THEMES: list[dict] = [
@@ -1723,8 +1752,40 @@ class HistoryManager:
         except Exception as e:
             log.error(f"❌ Redis advance_grammar_sentence_type_index error: {e}")
 
+    async def get_quiz_video_category_index(self) -> int:
+        try:
+            val = await self.r.get("quiz_video:category_index")
+            idx = int(val) if val is not None else 0
+            return idx % len(QUIZ_VIDEO_CATEGORIES)
+        except Exception as e:
+            log.error(f"❌ Redis get_quiz_video_category_index error: {e} — using index 0")
+            return 0
+
+    async def advance_quiz_video_category_index(self):
+        try:
+            current = await self.get_quiz_video_category_index()
+            next_idx = (current + 1) % len(QUIZ_VIDEO_CATEGORIES)
+            await self.r.set("quiz_video:category_index", str(next_idx))
+            log.info(f"🎬 quiz_video category index advanced: {current} → {next_idx}")
+        except Exception as e:
+            log.error(f"❌ Redis advance_quiz_video_category_index error: {e}")
+
+    async def get_quiz_video_used_questions(self) -> list:
+        try:
+            items = await self.r.lrange("used:quiz_video_questions", 0, 99)
+            return [str(x) for x in (items or []) if x]
+        except Exception as e:
+            log.error(f"❌ Redis get_quiz_video_used_questions error: {e}")
+            return []
+
+    async def add_quiz_video_question(self, question_key: str):
+        try:
+            await self.r.lpush("used:quiz_video_questions", question_key)
+            await self.r.ltrim("used:quiz_video_questions", 0, 199)
+        except Exception as e:
+            log.error(f"❌ Redis add_quiz_video_question error: {e}")
+
 # ──────────────────────────────────────────────
-# ФОТО API
 # ──────────────────────────────────────────────
 async def fetch_photo_unsplash(query: str, use_topics: bool = True, pick_random: bool = False) -> str | None:
     if not UNSPLASH_ACCESS_KEY:
@@ -3623,6 +3684,30 @@ Rules:
 - No emojis, no quotes, no stage directions.
 - English only."""
 
+    if rubric == "quiz_video":
+        category_id    = extra.get("category_id", "vocabulary")
+        category_label = extra.get("category_label", "Vocabulary")
+        category_desc  = extra.get("category_desc", "English word meanings")
+        return f"""You are an English teacher creating a short quiz card for social media video.
+Category (MANDATORY): {category_label} — {category_desc}
+{history_note}
+Return ONLY valid JSON, no markdown, no extra text:
+{{
+  "question": "Short engaging question in English (max 80 chars). For vocabulary: 'What does «Word» mean?'",
+  "options": ["Option A text", "Option B text", "Option C text", "Option D text"],
+  "correct_index": 0
+}}
+Rules:
+- Category is {category_id} — question MUST match this category
+- Question max 80 characters — must be punchy and clear
+- Options: exactly 4, English only, max 40 chars each
+- Options must be plausible — wrong answers should be tempting, not obviously wrong
+- correct_index is 0-based (0=A, 1=B, 2=C, 3=D)
+- For vocabulary questions: use 'What does «Word» mean?' format with the word in guillemets
+- For grammar: show a sentence with a blank ___
+- Keep A2-B1 difficulty — not too easy, not too hard
+- No Ukrainian text in JSON — all English"""
+
     raise ValueError(f"Unknown rubric: {rubric}")
 
 # ──────────────────────────────────────────────
@@ -5425,6 +5510,549 @@ async def publish_quiz(rubric: str, redis_client: UpstashRedis):
         await history_mgr.release_lock(rubric)
 
 
+def build_quiz_video_html(question: str, options: list, theme: str) -> str:
+    """Генерує HTML-анімацію для quiz_video у форматі 1080×1920 (9:16)."""
+    q_safe = _safe_html(question)
+    letters = ["A", "B", "C", "D"]
+    answers_html = ""
+    for i, (letter, opt) in enumerate(zip(letters, options[:4])):
+        opt_safe = _safe_html(opt)
+        delay = 0.6 + i * 0.25  # pop-effect delay per answer
+        answers_html += f"""
+        <div class="answer-btn" style="animation-delay:{delay:.2f}s">
+          <div class="answer-letter">{letter}</div>
+          <span class="answer-text">{opt_safe}</span>
+        </div>"""
+
+    theme_attr = f'data-theme="{theme}"' if theme != "ember" else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+<title>Quizmania</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --primary:#C8511A; --primary-dark:#9E3D0E; --primary-light:#E8693A;
+    --accent:#F0A500; --cream:#FDF4EE; --cream-dark:#F0DDD0;
+    --bg:#1F0E05; --text-main:#1F0A00; --text-muted:#8A5A40;
+    --glow:rgba(200,81,26,0.22);
+  }}
+  [data-theme="meadow"]    {{ --primary:#2D7A4F; --primary-dark:#1E5436; --primary-light:#3DAA6A; --accent:#F0A500; --cream:#F0F7F3; --cream-dark:#D9EDE3; --bg:#0F1F17; --text-main:#0F2318; --text-muted:#5A7A68; --glow:rgba(45,122,79,0.22); }}
+  [data-theme="midnight"]  {{ --primary:#5B8FD4; --primary-dark:#3A6AB0; --primary-light:#7AAAE8; --accent:#F0A500; --cream:#EEF2FA; --cream-dark:#D8E2F5; --bg:#0D1120; --text-main:#0D1530; --text-muted:#607898; --glow:rgba(91,143,212,0.22); }}
+  [data-theme="blossom"]   {{ --primary:#D4729A; --primary-dark:#B0527A; --primary-light:#EE90B8; --accent:#A076C0; --cream:#FFF5F9; --cream-dark:#FFE0EE; --bg:#1A0A12; --text-main:#1F0818; --text-muted:#9A6080; --glow:rgba(212,114,154,0.22); }}
+  [data-theme="lavender"]  {{ --primary:#9B6FD4; --primary-dark:#7248B0; --primary-light:#BC94F0; --accent:#D47298; --cream:#F8F3FF; --cream-dark:#ECDEFF; --bg:#130A20; --text-main:#160A28; --text-muted:#7A58A0; --glow:rgba(155,111,212,0.22); }}
+  [data-theme="tangerine"] {{ --primary:#E8702A; --primary-dark:#C04E10; --primary-light:#FF9050; --accent:#FFCC44; --cream:#FFF8F3; --cream-dark:#FFE8D8; --bg:#1A0C04; --text-main:#1F0C00; --text-muted:#9A5030; --glow:rgba(232,112,42,0.22); }}
+  [data-theme="mint"]      {{ --primary:#3ABFA0; --primary-dark:#1E9A80; --primary-light:#60D8B8; --accent:#5B8FD4; --cream:#F2FBF9; --cream-dark:#CCF0E8; --bg:#061814; --text-main:#041410; --text-muted:#3A7868; --glow:rgba(58,191,160,0.22); }}
+  [data-theme="ocean"]     {{ --primary:#2196C8; --primary-dark:#1470A0; --primary-light:#40B8E8; --accent:#F0A500; --cream:#EFF9FF; --cream-dark:#CCEEFF; --bg:#040E18; --text-main:#04101E; --text-muted:#3A6888; --glow:rgba(33,150,200,0.22); }}
+  [data-theme="cherry"]    {{ --primary:#D42B4A; --primary-dark:#A81E38; --primary-light:#F04868; --accent:#FFD166; --cream:#FFF0F3; --cream-dark:#FFD8DE; --bg:#180408; --text-main:#1C0408; --text-muted:#8A3850; --glow:rgba(212,43,74,0.22); }}
+  [data-theme="amber"]     {{ --primary:#D4930A; --primary-dark:#A87008; --primary-light:#F0B030; --accent:#E8502A; --cream:#FFFBF0; --cream-dark:#FFF0CC; --bg:#160E00; --text-main:#1A1000; --text-muted:#8A6820; --glow:rgba(212,147,10,0.22); }}
+  [data-theme="forest"]    {{ --primary:#4A7C59; --primary-dark:#2E5C3C; --primary-light:#6A9E78; --accent:#C8A84A; --cream:#F2F7EF; --cream-dark:#D8EDD0; --bg:#081208; --text-main:#081208; --text-muted:#4A6A50; --glow:rgba(74,124,89,0.22); }}
+
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+
+  html, body {{
+    width: 1080px;
+    height: 1920px;
+    overflow: hidden;
+    background: var(--bg);
+    font-family: 'DM Sans', sans-serif;
+  }}
+
+  .card-wrap {{
+    width: 1080px;
+    height: 1920px;
+    position: relative;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }}
+
+  /* Glow background */
+  .card-wrap::before {{
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(ellipse at 15% 12%, var(--glow) 0%, transparent 55%),
+      radial-gradient(ellipse at 85% 85%, rgba(240,165,0,0.06) 0%, transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }}
+
+  /* HEADER */
+  .card-header {{
+    position: relative;
+    z-index: 2;
+    padding: 80px 72px 60px;
+    background: var(--primary);
+    flex-shrink: 0;
+    overflow: hidden;
+  }}
+  .card-header::before {{
+    content:'';
+    position:absolute; top:-90px; right:-90px;
+    width:320px; height:320px;
+    background:rgba(255,255,255,0.07);
+    border-radius:50%;
+  }}
+  .card-header::after {{
+    content:'';
+    position:absolute; bottom:-70px; left:22%;
+    width:200px; height:200px;
+    background:rgba(0,0,0,0.07);
+    border-radius:50%;
+  }}
+
+  .brand {{
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 72px;
+    color: white;
+    letter-spacing: -1px;
+    position: relative;
+    z-index: 1;
+    line-height: 1;
+    margin-bottom: 10px;
+  }}
+  .header-sub {{
+    font-family: 'DM Sans', sans-serif;
+    font-size: 30px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.55);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    position: relative;
+    z-index: 1;
+  }}
+
+  /* BODY */
+  .card-body {{
+    position: relative;
+    z-index: 2;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 50px 50px 42px;
+    gap: 30px;
+    overflow: hidden;
+  }}
+
+  /* Question block */
+  .question-block {{
+    background: var(--cream);
+    border-radius: 48px;
+    padding: 60px 56px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.25);
+    flex-shrink: 0;
+    opacity: 0;
+    transform: scale(0.7);
+    animation: popIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.15s forwards;
+  }}
+  .question-block::before {{
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 8px;
+    background: linear-gradient(90deg, var(--primary), var(--accent));
+  }}
+  .q-label {{
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: 0.20em;
+    text-transform: uppercase;
+    color: var(--primary);
+    margin-bottom: 22px;
+  }}
+  .q-text {{
+    font-family: 'Syne', sans-serif;
+    font-size: 56px;
+    font-weight: 700;
+    color: var(--text-main);
+    line-height: 1.35;
+  }}
+
+  /* Answers list */
+  .answers-list {{
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    flex: 1;
+    justify-content: space-evenly;
+  }}
+
+  .answer-btn {{
+    display: flex;
+    align-items: center;
+    gap: 30px;
+    padding: 36px 42px;
+    border-radius: 36px;
+    background: linear-gradient(120deg, rgba(255,255,255,0.09) 0%, rgba(255,255,255,0.04) 100%);
+    border: 3px solid rgba(255,255,255,0.13);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.07);
+    opacity: 0;
+    transform: scale(0.5);
+    animation: popIn 0.45s cubic-bezier(0.34,1.56,0.64,1) forwards;
+  }}
+
+  .answer-letter {{
+    width: 80px;
+    height: 80px;
+    border-radius: 22px;
+    background: var(--primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 36px;
+    color: white;
+    flex-shrink: 0;
+  }}
+  .answer-text {{
+    font-size: 38px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.85);
+    flex: 1;
+    line-height: 1.3;
+  }}
+
+  /* CTA block */
+  .cta-block {{
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+    border-radius: 44px;
+    padding: 46px 50px;
+    display: flex;
+    align-items: center;
+    gap: 36px;
+    box-shadow: 0 12px 40px var(--glow);
+    position: relative;
+    overflow: hidden;
+    flex-shrink: 0;
+    opacity: 0;
+    transform: scale(0.7);
+    animation: popIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 1.6s forwards;
+  }}
+  .cta-block::before {{
+    content: '';
+    position: absolute;
+    top: -60px; right: -40px;
+    width: 200px; height: 200px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 50%;
+  }}
+  .cta-icon  {{ font-size: 72px; flex-shrink: 0; position: relative; z-index: 1; }}
+  .cta-text  {{ position: relative; z-index: 1; }}
+  .cta-title {{
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 42px;
+    color: white;
+    line-height: 1.2;
+    margin-bottom: 6px;
+  }}
+  .cta-sub   {{ font-size: 32px; color: rgba(255,255,255,0.62); }}
+
+  /* FOOTER */
+  .card-footer {{
+    position: relative;
+    z-index: 2;
+    padding: 20px 50px 50px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-shrink: 0;
+    opacity: 0;
+    animation: fadeIn 0.4s ease 1.9s forwards;
+  }}
+  .footer-dots {{ display: flex; gap: 14px; }}
+  .footer-dot  {{ width: 14px; height: 14px; border-radius: 50%; background: rgba(255,255,255,0.12); }}
+  .footer-dot:nth-child(2) {{ background: var(--accent); opacity: 0.5; }}
+
+  /* Animations */
+  @keyframes popIn {{
+    from {{ opacity: 0; transform: scale(0.5); }}
+    to   {{ opacity: 1; transform: scale(1); }}
+  }}
+  @keyframes fadeIn {{
+    from {{ opacity: 0; }}
+    to   {{ opacity: 1; }}
+  }}
+
+  /* Pause freeze — after animation ends the card stays fully visible */
+  .card-wrap.freeze * {{ animation-play-state: paused !important; }}
+</style>
+</head>
+<body>
+
+<div class="card-wrap" id="card" {theme_attr}>
+  <div class="card-header">
+    <div class="brand">Quizmania</div>
+    <div class="header-sub">Improve your English</div>
+  </div>
+
+  <div class="card-body">
+    <div class="question-block">
+      <div class="q-label">Question</div>
+      <div class="q-text">{q_safe}</div>
+    </div>
+
+    <div class="answers-list">
+      {answers_html}
+    </div>
+
+    <div class="cta-block">
+      <div class="cta-icon">💬</div>
+      <div class="cta-text">
+        <div class="cta-title">Напиши правильну відповідь</div>
+        <div class="cta-sub">Пиши A, B, C або D в коментарях 👇</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card-footer">
+    <div class="footer-dots">
+      <div class="footer-dot"></div>
+      <div class="footer-dot"></div>
+      <div class="footer-dot"></div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>"""
+
+
+async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
+    """
+    Рендерить HTML-анімацію у послідовність PNG-кадрів через Playwright,
+    потім склеює в MP4 через ffmpeg з ambient-музикою.
+    Повертає шлях до фінального .mp4 або None при помилці.
+    """
+    FPS = 30
+    TOTAL_SEC = 12        # 10с анімація + 2с пауза
+    ANIM_SEC  = 9.5       # доки анімація іде
+    PAUSE_SEC = 2.5       # фінальна пауза (картка статична)
+    TOTAL_FRAMES = FPS * TOTAL_SEC
+
+    frames_dir = os.path.join(tmpdir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    log.info(f"🎬 quiz_video: rendering {TOTAL_FRAMES} frames at {FPS}fps...")
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+            try:
+                page = await browser.new_page(viewport={"width": 1080, "height": 1920})
+                await page.set_content(html, wait_until="networkidle")
+                await asyncio.sleep(0.3)
+
+                for frame_num in range(TOTAL_FRAMES):
+                    t = frame_num / FPS
+
+                    # Встановлюємо CSS currentTime для анімації через DevTools
+                    await page.evaluate(f"""
+                        document.getAnimations().forEach(a => {{
+                            a.currentTime = {t * 1000};
+                        }});
+                    """)
+
+                    # Після ANIM_SEC — «заморожуємо» всі анімації на фінальному кадрі
+                    if t >= ANIM_SEC:
+                        await page.evaluate("""
+                            document.getAnimations().forEach(a => {
+                                a.pause();
+                            });
+                        """)
+
+                    frame_path = os.path.join(frames_dir, f"frame_{frame_num:05d}.png")
+                    await page.screenshot(path=frame_path, type="png", full_page=False)
+
+                    if frame_num % 60 == 0:
+                        log.info(f"🎬 quiz_video frames: {frame_num}/{TOTAL_FRAMES} ({t:.1f}s)")
+
+            finally:
+                await browser.close()
+    except Exception as e:
+        log.error(f"❌ quiz_video Playwright render error: {e}")
+        return None
+
+    # Склеюємо кадри в відео
+    raw_video = os.path.join(tmpdir, "raw_video.mp4")
+    cmd_video = [
+        FFMPEG_BIN, "-y",
+        "-framerate", str(FPS),
+        "-i", os.path.join(frames_dir, "frame_%05d.png"),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        raw_video,
+    ]
+    if not _run_ffmpeg(cmd_video):
+        log.error("❌ quiz_video: frame-to-video ffmpeg failed")
+        return None
+
+    # Генеруємо тиху ambient-музику через ffmpeg (sine + filter)
+    audio_path = os.path.join(tmpdir, "ambient.aac")
+    cmd_audio = [
+        FFMPEG_BIN, "-y",
+        "-f", "lavfi",
+        # Два синуси (80Hz + 220Hz) змішуємо, додаємо хорус і реверб → ambient підкладка
+        "-i", (
+            "sine=frequency=80:duration=12[s1];"
+            "sine=frequency=220:duration=12[s2];"
+            "[s1][s2]amix=inputs=2:duration=first[mix];"
+            "[mix]aecho=0.8:0.88:60:0.4[echo];"
+            "[echo]volume=0.18[out]"
+        ),
+        "-map", "[out]",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-t", str(TOTAL_SEC),
+        audio_path,
+    ]
+    audio_ok = _run_ffmpeg(cmd_audio)
+
+    final_path = os.path.join(tmpdir, "quiz_video_final.mp4")
+
+    if audio_ok and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
+        # Відео + ambient аудіо
+        cmd_mux = [
+            FFMPEG_BIN, "-y",
+            "-i", raw_video,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            "-movflags", "+faststart",
+            final_path,
+        ]
+    else:
+        # Без аудіо — просто перекодовуємо
+        log.warning("⚠️ quiz_video: ambient audio generation failed — video without audio")
+        cmd_mux = [
+            FFMPEG_BIN, "-y",
+            "-i", raw_video,
+            "-c:v", "copy",
+            "-an",
+            "-movflags", "+faststart",
+            final_path,
+        ]
+
+    if not _run_ffmpeg(cmd_mux):
+        log.error("❌ quiz_video: final mux ffmpeg failed")
+        return None
+
+    sz_mb = os.path.getsize(final_path) / (1024 * 1024)
+    log.info(f"✅ quiz_video final video: {sz_mb:.2f} MB | {TOTAL_SEC}s | {FPS}fps")
+    return final_path
+
+
+async def publish_quiz_video(rubric: str, redis_client: UpstashRedis):
+    """Повний пайплайн: Gemini → HTML → Playwright кадри → ffmpeg mp4 → Telegram sendVideo."""
+    history_mgr = HistoryManager(redis_client)
+    start_time  = time.time()
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log.info(f"🎬 START quiz_video [{rubric}] at {datetime.now().strftime('%H:%M:%S')}")
+
+    if not await history_mgr.acquire_lock(rubric, ttl=600):
+        log.warning(f"⚠️ Lock exists for [{rubric}] — skipping")
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix="quiz_vid_")
+    try:
+        # 1. Вибираємо категорію (ротація)
+        cat_idx  = await history_mgr.get_quiz_video_category_index()
+        category = QUIZ_VIDEO_CATEGORIES[cat_idx]
+        log.info(f"📚 quiz_video category: [{cat_idx}] {category['label']}")
+
+        # 2. Вибираємо тему кольору (рандомна кожного разу)
+        theme = random.choice(QUIZ_VIDEO_THEMES)
+        log.info(f"🎨 quiz_video theme: {theme}")
+
+        # 3. Генеруємо питання через Gemini
+        used_q = await history_mgr.get_quiz_video_used_questions()
+        history_for_prompt = used_q[-30:]
+
+        extra = {
+            "category_id":    category["id"],
+            "category_label": category["label"],
+            "category_desc":  category["desc"],
+        }
+
+        max_gen_attempts = 3
+        data = None
+        for attempt in range(1, max_gen_attempts + 1):
+            try:
+                data = await generate_content(rubric, history_for_prompt, extra)
+                # Валідація
+                question = str(data.get("question", "")).strip()
+                options  = data.get("options", [])
+                correct  = data.get("correct_index", -1)
+                if (question and len(question) <= 120
+                        and isinstance(options, list) and len(options) == 4
+                        and all(str(o).strip() for o in options)
+                        and isinstance(correct, int) and 0 <= correct <= 3):
+                    q_norm = _normalize_text(question)
+                    if not any(q_norm and q_norm in _normalize_text(h) for h in history_for_prompt if h):
+                        log.info(f"✅ quiz_video content generated (attempt {attempt}): {question[:60]}")
+                        break
+                log.warning(f"⚠️ quiz_video attempt {attempt}: validation failed — retrying")
+                data = None
+            except Exception as e:
+                log.warning(f"⚠️ quiz_video attempt {attempt} Gemini error: {e}")
+                data = None
+
+        if not data:
+            log.error("❌ quiz_video: Gemini failed all attempts — skipping")
+            return
+
+        question = str(data["question"]).strip()
+        options  = [str(o).strip() for o in data["options"]]
+        log.info(f"📝 quiz_video Q: {question}")
+        log.info(f"📝 quiz_video opts: {options}")
+
+        # 4. Будуємо HTML
+        html = build_quiz_video_html(question, options, theme)
+
+        # 5. Рендеримо відео (Playwright → ffmpeg)
+        final_path = await render_quiz_video_frames(html, tmpdir)
+        if not final_path:
+            log.error("❌ quiz_video: render failed — skipping")
+            return
+
+        # 6. Відправляємо в Telegram
+        success = await send_video_to_telegram(final_path, rubric)
+
+        if success:
+            q_key = _normalize_text(question)[:100]
+            await history_mgr.add_quiz_video_question(q_key)
+            await history_mgr.advance_quiz_video_category_index()
+            log.info(f"✅ quiz_video published | theme={theme} | category={category['label']}")
+        else:
+            log.error("❌ quiz_video: Telegram send failed")
+
+        elapsed = time.time() - start_time
+        log.info(f"⏱️ [{rubric}] completed in {elapsed:.1f}s | success={success}")
+
+    except Exception as e:
+        log.error(f"❌ CRITICAL ERROR in quiz_video: {e}", exc_info=True)
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        await history_mgr.release_lock(rubric)
+
+
 async def publish_placeholder_rubric(rubric: str, redis_client: UpstashRedis) -> None:
     _ = redis_client
     log.warning(f"⏭️ [{rubric}] — rubric scheduled but not implemented yet; skipping publish")
@@ -5434,6 +6062,8 @@ async def publish_card(rubric: str, redis_client: UpstashRedis):
     """Ручний тест: GET /test/<rubric> (HealthHandler); для відео — GET /test/travel_video."""
     if rubric in PLACEHOLDER_RUBRICS:
         await publish_placeholder_rubric(rubric, redis_client)
+    elif rubric == VIDEO_QUIZ_RUBRIC:
+        await publish_quiz_video(rubric, redis_client)
     elif rubric in QUIZ_RUBRICS:
         await publish_quiz(rubric, redis_client)
     elif rubric == "travel_video":
@@ -5452,6 +6082,7 @@ VALID_RUBRICS = sorted(
     set(WEEKDAY_10_00.values())
     | {r for _, r in QUIZ_SLOTS}
     | set(WEEKEND_16_00.values())
+    | {VIDEO_QUIZ_RUBRIC}
 )
 
 RUBRIC_HELP = "\n".join(f"  /test/{r}" for r in VALID_RUBRICS)
@@ -5460,6 +6091,7 @@ RUBRIC_HELP = "\n".join(f"  /test/{r}" for r in VALID_RUBRICS)
 TEST_ENDPOINTS_DOC = f"""English A2 Bot v2.0 — OK
 
 Manual test: GET /test/{{rubric}} — одноразово запускає публікацію (перевірте Telegram).
+  Квіз-відео:    GET /test/quiz_video   — Gemini → pop-анімація → ffmpeg ambient → sendVideo.
   Приклад відео: GET /test/travel_video — той самий пайплайн, що й у неділю 16:00 (sendVideo без підпису).
 
 Пн–Пт 10:00 Europe/Kyiv — великі пости (PNG):
@@ -5467,13 +6099,16 @@ Manual test: GET /test/{{rubric}} — одноразово запускає пу
   vocabulary_15        — 15 слів + IPA (кремова картка)
   daily_phrase         — фраза дня + приклад (en) + переклад (ua)
   situation_phrases    — 5 фраз (en/ua) для життєвої ситуації
-  photo_relax          — природа: чисте фото PNG; 4 речення (en, «живий» п’ятничний релакс, ротація стилю голосу)
+  photo_relax          — природа: чисте фото PNG; 4 речення (en, «живий» п'ятничний релакс, ротація стилю голосу)
 
 Пн–Пт — квізи (Telegram poll):
   grammar_quiz           (11:30)
   vocabulary_quiz        (13:00)
   confusing_words_quiz   (14:30)
   prepositions_quiz      (16:00)
+
+Щодня 18:00 і 20:00 Europe/Kyiv — quiz_video (MP4 анімація 9:16, Quizmania стиль):
+  quiz_video — Gemini (ротація 10 категорій) → pop-анімація → ffmpeg + ambient → sendVideo
 
 Сб 16:00 Europe/Kyiv — чисте фото PNG + текст у caption:
   interesting_cities   — фото + 3–5 речень англ. (живий тон; без окремого гачка й без фінального питання)
