@@ -5830,52 +5830,74 @@ def build_quiz_video_html(question: str, options: list, theme: str) -> str:
 
 async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
     """
-    Рендерить HTML-анімацію у послідовність PNG-кадрів через Playwright,
-    потім склеює в MP4 через ffmpeg з ambient-музикою.
-    Повертає шлях до фінального .mp4 або None при помилці.
+    Підхід: рендеримо ЛИШЕ 10 ключових знімків (keyframes) через Playwright,
+    потім ffmpeg concat із заданою тривалістю кожного сегменту → плавне відео.
+
+    Це замість 360 кадрів — економить ~97% RAM і часу.
+    Анімація виглядає як slideshow із cross-fade між ключовими моментами.
+
+    Таймлайн ключових кадрів (totalSec = 12):
+      t=0.00  → порожня картка (фон + header видимі)
+      t=0.20  → питання з'являється (pop)
+      t=0.65  → відповідь A з'явилась
+      t=0.90  → відповідь B з'явилась
+      t=1.15  → відповідь C з'явилась
+      t=1.40  → відповідь D з'явилась
+      t=1.70  → CTA блок з'явився
+      t=2.20  → всі елементи повністю на місці (статика)
+      t=9.50  → фінальна статика (пауза)   ← той самий знімок, але окремо
+      t=12.0  → кінець (той самий кадр)
     """
-    FPS = 30
-    TOTAL_SEC = 12        # 10с анімація + 2с пауза
-    ANIM_SEC  = 9.5       # доки анімація іде
-    PAUSE_SEC = 2.5       # фінальна пауза (картка статична)
-    TOTAL_FRAMES = FPS * TOTAL_SEC
+    TOTAL_SEC = 12.0
+
+    # Ключові моменти: (time_ms, duration_sec_for_this_segment, label)
+    # duration — скільки секунд цей кадр "тримається" у відео
+    KEYFRAMES: list[tuple[float, float, str]] = [
+        (0,     0.20,  "k00_blank"),
+        (200,   0.45,  "k01_question"),
+        (650,   0.25,  "k02_ansA"),
+        (900,   0.25,  "k03_ansB"),
+        (1150,  0.25,  "k04_ansC"),
+        (1400,  0.30,  "k05_ansD"),
+        (1700,  0.50,  "k06_cta"),
+        (2200,  7.30,  "k07_full_static"),
+        (9500,  2.50,  "k08_pause"),
+    ]
+    # Перевірка суми тривалостей
+    total_check = sum(d for _, d, _ in KEYFRAMES)
+    if abs(total_check - TOTAL_SEC) > 0.05:
+        log.warning(f"⚠️ quiz_video keyframe durations sum={total_check:.2f} (expected {TOTAL_SEC})")
 
     frames_dir = os.path.join(tmpdir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
 
-    log.info(f"🎬 quiz_video: rendering {TOTAL_FRAMES} frames at {FPS}fps...")
+    log.info(f"🎬 quiz_video: rendering {len(KEYFRAMES)} keyframes (low-RAM mode)...")
 
+    # 1. Playwright — робимо по одному screenshot для кожного ключового моменту
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
             try:
                 page = await browser.new_page(viewport={"width": 1080, "height": 1920})
                 await page.set_content(html, wait_until="networkidle")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.4)  # чекаємо завантаження шрифтів
 
-                for frame_num in range(TOTAL_FRAMES):
-                    t = frame_num / FPS
-
-                    # Встановлюємо CSS currentTime для анімації через DevTools
+                for idx, (t_ms, duration, label) in enumerate(KEYFRAMES):
+                    # Переводимо анімацію на потрібний момент часу
                     await page.evaluate(f"""
                         document.getAnimations().forEach(a => {{
-                            a.currentTime = {t * 1000};
+                            try {{
+                                a.currentTime = {t_ms};
+                                a.pause();
+                            }} catch(e) {{}}
                         }});
                     """)
+                    # Даємо браузеру відмалювати кадр
+                    await asyncio.sleep(0.05)
 
-                    # Після ANIM_SEC — «заморожуємо» всі анімації на фінальному кадрі
-                    if t >= ANIM_SEC:
-                        await page.evaluate("""
-                            document.getAnimations().forEach(a => {
-                                a.pause();
-                            });
-                        """)
-
-                    frame_path = os.path.join(frames_dir, f"frame_{frame_num:05d}.png")
+                    frame_path = os.path.join(frames_dir, f"{label}.png")
                     await page.screenshot(path=frame_path, type="png", full_page=False)
-
-                    if frame_num % 60 == 0:
-                        log.info(f"🎬 quiz_video frames: {frame_num}/{TOTAL_FRAMES} ({t:.1f}s)")
+                    log.info(f"🖼️ quiz_video keyframe [{idx+1}/{len(KEYFRAMES)}] t={t_ms}ms → {label}.png")
 
             finally:
                 await browser.close()
@@ -5883,48 +5905,70 @@ async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
         log.error(f"❌ quiz_video Playwright render error: {e}")
         return None
 
-    # Склеюємо кадри в відео
+    # 2. Будуємо concat list для ffmpeg
+    # Кожен сегмент: loop=1 (один кадр), duration=N секунд
+    concat_list_path = os.path.join(tmpdir, "concat.txt")
+    with open(concat_list_path, "w") as f:
+        for _, duration, label in KEYFRAMES:
+            frame_path = os.path.join(frames_dir, f"{label}.png")
+            if not os.path.isfile(frame_path):
+                log.error(f"❌ quiz_video: missing keyframe {label}.png")
+                return None
+            f.write(f"file '{frame_path}'\n")
+            f.write(f"duration {duration:.3f}\n")
+        # ffmpeg concat demuxer вимагає повторити останній файл без duration
+        last_label = KEYFRAMES[-1][2]
+        f.write(f"file '{os.path.join(frames_dir, last_label)}.png'\n")
+
+    # 3. ffmpeg: concat PNG slideshow → raw h264
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
     cmd_video = [
         FFMPEG_BIN, "-y",
-        "-framerate", str(FPS),
-        "-i", os.path.join(frames_dir, "frame_%05d.png"),
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_list_path,
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
         "-c:v", "libx264",
         "-preset", "fast",
-        "-crf", "20",
+        "-crf", "22",
         "-pix_fmt", "yuv420p",
+        "-r", "30",          # output fps
         "-movflags", "+faststart",
         raw_video,
     ]
     if not _run_ffmpeg(cmd_video):
-        log.error("❌ quiz_video: frame-to-video ffmpeg failed")
+        log.error("❌ quiz_video: concat-to-video ffmpeg failed")
         return None
 
-    # Генеруємо тиху ambient-музику через ffmpeg (sine + filter)
+    log.info(f"✅ quiz_video raw video built: {os.path.getsize(raw_video) / 1024:.0f} KB")
+
+    # 4. Генеруємо ambient-музику (окремий ffmpeg, легкий)
     audio_path = os.path.join(tmpdir, "ambient.aac")
+    # Простий ambient: два синуси + ехо + fade in/out
     cmd_audio = [
         FFMPEG_BIN, "-y",
         "-f", "lavfi",
-        # Два синуси (80Hz + 220Hz) змішуємо, додаємо хорус і реверб → ambient підкладка
-        "-i", (
-            "sine=frequency=80:duration=12[s1];"
-            "sine=frequency=220:duration=12[s2];"
-            "[s1][s2]amix=inputs=2:duration=first[mix];"
-            "[mix]aecho=0.8:0.88:60:0.4[echo];"
-            "[echo]volume=0.18[out]"
+        "-i", f"sine=frequency=80:duration={TOTAL_SEC}",
+        "-f", "lavfi",
+        "-i", f"sine=frequency=200:duration={TOTAL_SEC}",
+        "-filter_complex",
+        (
+            "[0][1]amix=inputs=2:duration=first[mix];"
+            "[mix]aecho=0.8:0.88:60:0.3[echo];"
+            f"[echo]afade=t=in:st=0:d=1,afade=t=out:st={TOTAL_SEC - 1.5}:d=1.5[out];"
+            "[out]volume=0.15[final]"
         ),
-        "-map", "[out]",
+        "-map", "[final]",
         "-c:a", "aac",
-        "-b:a", "128k",
-        "-t", str(TOTAL_SEC),
+        "-b:a", "96k",
         audio_path,
     ]
     audio_ok = _run_ffmpeg(cmd_audio)
 
+    # 5. Фінальний мукс відео + аудіо
     final_path = os.path.join(tmpdir, "quiz_video_final.mp4")
 
     if audio_ok and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
-        # Відео + ambient аудіо
         cmd_mux = [
             FFMPEG_BIN, "-y",
             "-i", raw_video,
@@ -5935,9 +5979,9 @@ async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
             "-movflags", "+faststart",
             final_path,
         ]
+        log.info("🎵 quiz_video: muxing with ambient audio")
     else:
-        # Без аудіо — просто перекодовуємо
-        log.warning("⚠️ quiz_video: ambient audio generation failed — video without audio")
+        log.warning("⚠️ quiz_video: ambient audio failed — video without audio")
         cmd_mux = [
             FFMPEG_BIN, "-y",
             "-i", raw_video,
@@ -5952,7 +5996,7 @@ async def render_quiz_video_frames(html: str, tmpdir: str) -> str | None:
         return None
 
     sz_mb = os.path.getsize(final_path) / (1024 * 1024)
-    log.info(f"✅ quiz_video final video: {sz_mb:.2f} MB | {TOTAL_SEC}s | {FPS}fps")
+    log.info(f"✅ quiz_video final: {sz_mb:.2f} MB | {TOTAL_SEC}s | keyframe-mode")
     return final_path
 
 
